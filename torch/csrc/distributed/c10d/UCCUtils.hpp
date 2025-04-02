@@ -110,6 +110,7 @@ struct torch_ucc_oob_coll_info_t {
   int size;
   void* rbuf;
   size_t msglen;
+  int dscp;
   std::string getKey(std::string key) {
     return std::to_string(comm_id) + key;
   }
