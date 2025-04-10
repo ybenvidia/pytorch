@@ -1986,7 +1986,7 @@ def _new_process_group_helper(
             # RuntimeError if is_ucc_available() returns false.
 
             if dscp is None:
-                dscp = 0
+                dscp = -1
 
             backend_class = ProcessGroupUCC(
                 backend_prefix_store, group_rank, group_size, timeout=timeout, dscp=dscp
@@ -5258,7 +5258,7 @@ def _new_group_with_tag(
     group_name = _process_group_name(ranks, use_hashed_name=use_local_synchronization)
 
     if dscp is None:
-        dscp = 0
+        dscp = -1
 
     pg, pg_store = _new_process_group_helper(
         group_world_size,

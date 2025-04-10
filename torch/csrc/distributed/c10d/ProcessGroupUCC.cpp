@@ -577,14 +577,14 @@ ProcessGroupUCC::ProcessGroupUCC(
     int rank,
     int size,
     std::chrono::duration<float> timeout,
-    int collectives_prio_dscp)
-    : Backend(rank, size), timeout_(timeout), dscp_(dscp) {
+    int dscp)
+    : Backend(rank, size), timeout_(timeout) {
   c10::call_once(torch_ucc_config.flag, read_config);
   oob = std::make_shared<torch_ucc_oob_coll_info_t>();
   oob->rank = rank;
   oob->size = size;
   oob->store = store;
-  oob->dscp = dscp_;
+  oob->dscp = dscp;
   comm = nullptr;
   cuda_ee = nullptr;
   static uint32_t id = 0;

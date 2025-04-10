@@ -154,7 +154,7 @@ class TORCH_API ProcessGroupUCC : public Backend {
       int rank = -1,
       int size = -1,
       std::chrono::duration<float> timeout = kBackendDefaultTimeout,
-      int dscp = 0);
+      int dscp = -1);
 
   void initComm(c10::Device dev);
 
@@ -293,7 +293,6 @@ class TORCH_API ProcessGroupUCC : public Backend {
   event_pool_t ep;
 #endif
   c10::intrusive_ptr<ProcessGroupUCCLogger> logger;
-  int dscp_;
 };
 
 class Comm {
@@ -308,7 +307,6 @@ class Comm {
   bool stop_progress_loop;
   bool collective_inprogress;
   torch_ucc_phase_t finalize_phase;
-  int dscp_;
 
  public:
   c10::DeviceIndex cuda_device_index;
@@ -316,8 +314,7 @@ class Comm {
       const c10::intrusive_ptr<ProcessGroupUCCLogger>& logger,
       std::shared_ptr<torch_ucc_oob_coll_info_t> oob,
       c10::Device dev,
-      bool is_health_check,
-      int dscp);
+      bool is_health_check);
 
   ~Comm();
 
