@@ -633,7 +633,7 @@ class ProcessGroupUCC(Backend):
         rank: int,
         size: int,
         timeout: timedelta,
-        dscp: int
+        traffic_class: int
     ) -> None: ...
 
 class ProcessGroupMPI(Backend):

@@ -3190,19 +3190,19 @@ Example::
                           int rank,
                           int size,
                           const std::chrono::milliseconds& timeout,
-                          int dscp) {
+                          int traffic_class) {
                 // gil_scoped_release is not safe as a call_guard in init.
                 // https://github.com/pybind/pybind11/issues/5473
                 py::gil_scoped_release nogil{};
 
                 return c10::make_intrusive<::c10d::ProcessGroupUCC>(
-                    store, rank, size, timeout, dscp);
+                    store, rank, size, timeout, traffic_class);
               }),
               py::arg("store"),
               py::arg("rank"),
               py::arg("size"),
               py::arg("timeout") = kProcessGroupDefaultTimeout,
-              py::arg("dscp") = -1);
+              py::arg("traffic_class") = -1);
 #endif
 
   py::enum_<::c10d::OpType>(module, "OpType")

@@ -426,7 +426,7 @@ void Comm::ucc_create_team(
   ucc_status_t st;
   ucc_team_params_t team_params;
   team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_EP_RANGE |
-      UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_EP_DSCP;
+      UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_EP_TRAFFIC_CLASS;
   team_params.oob.allgather = oob_allgather;
   team_params.oob.req_test = oob_allgather_test;
   team_params.oob.req_free = oob_allgather_free;
@@ -435,7 +435,7 @@ void Comm::ucc_create_team(
   team_params.oob.oob_ep = oob->rank;
   team_params.ep = oob->rank;
   team_params.ep_range = UCC_COLLECTIVE_EP_RANGE_CONTIG;
-  team_params.ep_dscp = oob->dscp;
+  team_params.ep_traffic_class = oob->traffic_class;
   TORCH_UCC_CHECK(
       ucc_team_create_post(&ucc_comm.context, 1, &team_params, &team),
       "failed to post team create");
@@ -577,14 +577,14 @@ ProcessGroupUCC::ProcessGroupUCC(
     int rank,
     int size,
     std::chrono::duration<float> timeout,
-    int dscp)
+    int traffic_class)
     : Backend(rank, size), timeout_(timeout) {
   c10::call_once(torch_ucc_config.flag, read_config);
   oob = std::make_shared<torch_ucc_oob_coll_info_t>();
   oob->rank = rank;
   oob->size = size;
   oob->store = store;
-  oob->dscp = dscp;
+  oob->traffic_class = traffic_class;
   comm = nullptr;
   cuda_ee = nullptr;
   static uint32_t id = 0;
