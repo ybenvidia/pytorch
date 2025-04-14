@@ -154,7 +154,7 @@ class TORCH_API ProcessGroupUCC : public Backend {
       int rank = -1,
       int size = -1,
       std::chrono::duration<float> timeout = kBackendDefaultTimeout,
-      int dscp = -1);
+      int traffic_class = -1);
 
   void initComm(c10::Device dev);
 

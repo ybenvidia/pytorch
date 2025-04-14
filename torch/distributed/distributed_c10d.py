@@ -1817,7 +1817,7 @@ def _new_process_group_helper(
     pg_tag=None,
     device_id=None,
     group_desc=None,
-    dscp=None
+    traffic_class=None
 ):
     """
     Create a new distributed process group.
@@ -1985,11 +1985,11 @@ def _new_process_group_helper(
             # is_ucc_available() from above elif-condition and raise
             # RuntimeError if is_ucc_available() returns false.
 
-            if dscp is None:
-                dscp = -1
+            if traffic_class is None:
+                traffic_class = -1
 
             backend_class = ProcessGroupUCC(
-                backend_prefix_store, group_rank, group_size, timeout=timeout, dscp=dscp
+                backend_prefix_store, group_rank, group_size, timeout=timeout, traffic_class=traffic_class
             )
             backend_type = ProcessGroup.BackendType.UCC
         elif backend_str == Backend.XCCL:
@@ -5094,7 +5094,7 @@ def new_group(
     use_local_synchronization=False,
     group_desc=None,
     device_id: Optional[torch.device] = None,
-    dscp=None
+    traffic_class=None
 ):
     """
     Create a new distributed group.
@@ -5174,7 +5174,7 @@ def new_group(
         use_local_synchronization=use_local_synchronization,
         group_desc=group_desc,
         device_id=device_id,
-        dscp=dscp
+        traffic_class=traffic_class
     )
 
 
@@ -5187,7 +5187,7 @@ def _new_group_with_tag(
     use_local_synchronization=False,
     group_desc=None,
     device_id: Optional[torch.device] = None,
-    dscp=None
+    traffic_class=None
 ):
     """
     Variant of ``new_group`` that exposes tag creation.
@@ -5257,8 +5257,8 @@ def _new_group_with_tag(
 
     group_name = _process_group_name(ranks, use_hashed_name=use_local_synchronization)
 
-    if dscp is None:
-        dscp = -1
+    if traffic_class is None:
+        traffic_class = -1
 
     pg, pg_store = _new_process_group_helper(
         group_world_size,
@@ -5272,7 +5272,7 @@ def _new_group_with_tag(
         pg_tag=pg_tag,
         device_id=device_id,
         group_desc=group_desc,
-        dscp=dscp
+        traffic_class=traffic_class
     )
 
     # Create the global rank to group rank mapping
