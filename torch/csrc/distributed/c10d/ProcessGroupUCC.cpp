@@ -426,7 +426,7 @@ void Comm::ucc_create_team(
   ucc_status_t st;
   ucc_team_params_t team_params;
   team_params.mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_EP_RANGE |
-      UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_EP_TRAFFIC_CLASS;
+      UCC_TEAM_PARAM_FIELD_OOB;
   team_params.oob.allgather = oob_allgather;
   team_params.oob.req_test = oob_allgather_test;
   team_params.oob.req_free = oob_allgather_free;
@@ -436,6 +436,11 @@ void Comm::ucc_create_team(
   team_params.ep = oob->rank;
   team_params.ep_range = UCC_COLLECTIVE_EP_RANGE_CONTIG;
   team_params.ep_traffic_class = oob->traffic_class;
+
+  if (oob->traffic_class != -1) {
+    team_params.mask |= UCC_TEAM_PARAM_FIELD_EP_TRAFFIC_CLASS;
+  }
+
   TORCH_UCC_CHECK(
       ucc_team_create_post(&ucc_comm.context, 1, &team_params, &team),
       "failed to post team create");
