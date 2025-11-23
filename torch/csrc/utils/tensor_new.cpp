@@ -304,7 +304,7 @@ Tensor internal_new_from_data(
     TORCH_CHECK(
         !pin_memory,
         "Can't pin tensor constructed from __cuda_array_interface__");
-    auto tensor = tensor_from_cuda_array_interface(data);
+    auto tensor = tensor_from_cuda_array_interface(data, device_opt);
     const auto& inferred_scalar_type =
         type_inference ? tensor.scalar_type() : scalar_type;
 
@@ -556,6 +556,7 @@ void check_base_legacy_new(
         c10::DispatchKey::SparseCUDA,
         c10::DispatchKey::SparseHIP,
         c10::DispatchKey::SparseXPU,
+        c10::DispatchKey::SparseMPS,
         c10::DispatchKey::SparsePrivateUse1,
     });
     TORCH_CHECK(
@@ -669,11 +670,13 @@ Tensor legacy_sparse_tensor_generic_ctor_new(
       // new(sequence) binds to this signature but should be treated differently
       // unless the sequences is a torch.Size
       if (ctor_or_new == CtorOrNew::CTOR) {
-        throw TypeError(
+        TORCH_CHECK_TYPE(
+            false,
             "torch.sparse.SparseTensor(sequence) only accepts sizes.  Please use torch.sparse_coo_tensor() "
             "or construct a strided tensor and convert it to sparse via to_sparse.");
       } else {
-        throw TypeError(
+        TORCH_CHECK_TYPE(
+            false,
             "SparseTensor.new(sequence) only accepts sizes.  Please use torch.sparse_coo_tensor() "
             "or construct a strided tensor and convert it to sparse via to_sparse.");
       }
@@ -686,7 +689,7 @@ Tensor legacy_sparse_tensor_generic_ctor_new(
     return new_with_sizes(
         options, scalar_type, deviceOptional, r.symintlist(0));
   }
-  throw std::runtime_error("new(): invalid arguments");
+  TORCH_CHECK(false, "new(): invalid arguments");
 }
 
 // NB: device_idx here is NOT a DeviceIndex, but index into PythonArgs
@@ -805,7 +808,7 @@ static Tensor legacy_tensor_generic_ctor_new(
     return legacy_new_from_sequence(
         options, scalar_type, deviceOptional, r.pyobject(0));
   }
-  throw std::runtime_error("new(): invalid arguments");
+  TORCH_CHECK(false, "new(): invalid arguments");
 }
 
 // Handles ONLY torch.Tensor
@@ -1069,7 +1072,7 @@ static Tensor sparse_compressed_tensor_ctor_worker(
                values.options().layout(layout).pinned_memory(pin_memory))
         .set_requires_grad(r.toBool(ARG_REQUIRES_GRAD1));
   }
-  throw std::runtime_error(name + ": invalid arguments");
+  TORCH_CHECK(false, name + ": invalid arguments");
 }
 
 Tensor sparse_compressed_tensor_ctor(
@@ -1271,7 +1274,7 @@ Tensor sparse_coo_tensor_ctor(
                inferred_options.dtype(inferred_scalar_type).layout(at::kSparse))
         .set_requires_grad(r.toBool(ARG_REQUIRES_GRAD2));
   }
-  throw std::runtime_error("sparse_coo_tensor(): invalid arguments");
+  TORCH_CHECK(false, "sparse_coo_tensor(): invalid arguments");
 }
 
 void _validate_sparse_coo_tensor_args(
@@ -1494,14 +1497,14 @@ Tensor tensor_ctor(
         pin_memory);
     auto names = r.toDimnameListOptional(5);
     if (names) {
-      at::namedinference::propagate_names(
+      at::namedinference::propagate_names_if_nonempty(
           new_tensor, *names, /*validate_names=*/true);
     }
     new_tensor.detach_(); // ensure new_tensor a leaf node
     new_tensor.set_requires_grad(args_requires_grad);
     return new_tensor;
   }
-  throw std::runtime_error("tensor(): invalid arguments");
+  TORCH_CHECK(false, "tensor(): invalid arguments");
 }
 
 Tensor as_tensor(
@@ -1520,7 +1523,7 @@ Tensor as_tensor(
         /*copy_numpy=*/false,
         /*type_inference=*/type_inference);
   }
-  throw std::runtime_error("tensor(): invalid arguments");
+  TORCH_CHECK(false, "tensor(): invalid arguments");
 }
 
 Tensor new_tensor(
@@ -1558,7 +1561,7 @@ Tensor new_tensor(
     new_tensor.set_requires_grad(args_requires_grad);
     return new_tensor;
   }
-  throw std::runtime_error("new_tensor(): invalid arguments");
+  TORCH_CHECK(false, "new_tensor(): invalid arguments");
 }
 
 Tensor tensor_frombuffer(
@@ -1653,19 +1656,23 @@ Tensor tensor_frombuffer(
   return tensor;
 }
 
-Tensor tensor_fromDLPack(PyObject* data) {
-  DLManagedTensor* dlMTensor =
-      (DLManagedTensor*)PyCapsule_GetPointer(data, "dltensor");
-  TORCH_CHECK(
-      dlMTensor,
-      "from_dlpack received an invalid capsule. "
-      "Note that DLTensor capsules can be consumed only once, "
-      "so you might have already constructed a tensor from it once.");
+namespace {
 
-  auto deleter_with_gil = [dlMTensor](void*) {
-    if (dlMTensor->deleter) {
-      pybind11::gil_scoped_acquire gil;
-      dlMTensor->deleter(dlMTensor);
+template <class T>
+at::Tensor tensor_fromDLPackImpl(PyObject* data, T* tensor) {
+  // HACK: Ensure that we hold the GIL here just in case the
+  // managed tensor originating from a buggy NumPy build.
+  bool is_numpy_dlpack_deleter_bugged =
+      torch::utils::is_numpy_dlpack_deleter_bugged();
+
+  auto deleter_maybe_gil = [=](void*) {
+    if (tensor->deleter) {
+      if (is_numpy_dlpack_deleter_bugged) {
+        pybind11::gil_scoped_acquire gil;
+        tensor->deleter(tensor);
+      } else {
+        tensor->deleter(tensor);
+      }
     }
   };
 
@@ -1673,14 +1680,11 @@ Tensor tensor_fromDLPack(PyObject* data) {
   // destructor function that will be called when the underlying storage goes
   // out of scope. When the destructor is called, the dlMTensor is destructed
   // too.
-  // HACK: Ensure that we hold the GIL here just in case the
-  // managed tensor originating from a buggy NumPy build.
-  auto atensor = torch::utils::is_numpy_dlpack_deleter_bugged()
-      ? at::fromDLPack(dlMTensor, std::move(deleter_with_gil))
-      : at::fromDLPack(dlMTensor);
+  auto atensor =
+      at::DLPackTraits<T>::fromDLPack(tensor, std::move(deleter_maybe_gil));
 
   // Make sure this capsule will never be used again.
-  PyCapsule_SetName(data, "used_dltensor");
+  PyCapsule_SetName(data, at::DLPackTraits<T>::used);
 
   // It is possible that the call to at::fromDLPack is the very first
   // call to create a Tensor in PyTorch. If so, then _lazy_init has
@@ -1690,6 +1694,44 @@ Tensor tensor_fromDLPack(PyObject* data) {
   // we have called _lazy_init here
   maybe_initialize_device(atensor.device());
   return atensor;
+}
+
+// Check whether `data` is a valid DLPack capsule.
+// This function checks for the versioned and unversioned forms.
+bool isValidDLPackCapsule(PyObject* data) {
+  return PyCapsule_IsValid(
+             data, at::DLPackTraits<DLManagedTensorVersioned>::capsule) ||
+      PyCapsule_IsValid(data, at::DLPackTraits<DLManagedTensor>::capsule);
+}
+
+} // namespace
+
+Tensor tensor_fromDLPack(PyObject* data) {
+  const char* bad_capsule =
+      "from_dlpack received an invalid capsule. "
+      "Note that DLTensor capsules can be consumed only once, "
+      "so you might have already constructed a tensor from it once.";
+
+  if (PyCapsule_IsValid(
+          data, at::DLPackTraits<DLManagedTensorVersioned>::capsule)) {
+    auto versioned = (DLManagedTensorVersioned*)PyCapsule_GetPointer(
+        data, at::DLPackTraits<DLManagedTensorVersioned>::capsule);
+
+    TORCH_CHECK(versioned != nullptr, bad_capsule);
+    TORCH_CHECK(
+        versioned->version.major <= DLPACK_MAJOR_VERSION,
+        "unsupported DLPack capsule major version: ",
+        versioned->version.major,
+        ". Maximum supported version: ",
+        DLPACK_MAJOR_VERSION);
+
+    return tensor_fromDLPackImpl(data, versioned);
+  } else {
+    auto managed = (DLManagedTensor*)PyCapsule_GetPointer(
+        data, at::DLPackTraits<DLManagedTensor>::capsule);
+    TORCH_CHECK(managed != nullptr, bad_capsule);
+    return tensor_fromDLPackImpl(data, managed);
+  }
 }
 
 Tensor asarray(
@@ -1756,7 +1798,7 @@ Tensor asarray(
 #endif
 
   // Check whether 'obj' is a 'DLPack' capsule
-  if (!tensor.defined() && PyCapsule_IsValid(obj, "dltensor") != 0) {
+  if (!tensor.defined() && isValidDLPackCapsule(obj)) {
     tensor = tensor_fromDLPack(obj);
   }
 

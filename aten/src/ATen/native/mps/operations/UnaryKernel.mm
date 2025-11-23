@@ -14,6 +14,7 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #include <ATen/native/mps/UnaryKernel_metallib.h>
 #endif
 
+// KURT: call site of `exec_unary_kernel`
 #define REGISTER_UNARY_TI_DISPATCH(NAME)                    \
   static void NAME##_kernel_mps(TensorIteratorBase& iter) { \
     lib.exec_unary_kernel(iter, #NAME);                     \
@@ -33,6 +34,7 @@ REGISTER_UNARY_TI_DISPATCH(sinc);
 REGISTER_UNARY_TI_DISPATCH(sinh);
 REGISTER_UNARY_TI_DISPATCH(cosh);
 REGISTER_UNARY_TI_DISPATCH(tanh);
+REGISTER_UNARY_TI_DISPATCH(angle);
 REGISTER_UNARY_TI_DISPATCH(abs);
 REGISTER_UNARY_TI_DISPATCH(sin);
 REGISTER_UNARY_TI_DISPATCH(cos);
@@ -49,6 +51,7 @@ REGISTER_UNARY_TI_DISPATCH(log2);
 REGISTER_UNARY_TI_DISPATCH(log);
 REGISTER_UNARY_TI_DISPATCH(log1p);
 REGISTER_UNARY_TI_DISPATCH(bitwise_not);
+REGISTER_UNARY_TI_DISPATCH(round);
 REGISTER_UNARY_TI_DISPATCH(sigmoid);
 REGISTER_DISPATCH(round_decimals_stub, round_decimals_kernel);
 } // namespace at::native

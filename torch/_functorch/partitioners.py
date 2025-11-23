@@ -9,9 +9,12 @@ import math
 import operator
 import os
 import os.path
+import re
+import warnings
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+from typing import Any, Optional, TYPE_CHECKING, Union
 
 import torch
 import torch._inductor.inductor_prims
@@ -44,10 +47,13 @@ from . import config
 from ._activation_checkpointing.graph_info_provider import GraphInfoProvider
 from ._activation_checkpointing.knapsack import (
     dp_knapsack,
+    dp_knapsack_sliding_hirschberg,
     greedy_knapsack,
     ilp_knapsack,
 )
 from ._activation_checkpointing.knapsack_evaluator import KnapsackEvaluator
+from ._aot_autograd.descriptors import AOTOutput, SavedForBackwardsAOTOutput
+from ._aot_autograd.functional_utils import _is_functional_graph
 from ._aot_autograd.logging_utils import get_aot_graph_name
 from ._aot_autograd.utils import get_cuda_generator_meta_val, is_with_effects
 from .compile_utils import fx_graph_cse, get_aten_target, raise_getitems
@@ -175,7 +181,9 @@ def _extract_graph_with_inputs_outputs(
     joint_graph: fx.Graph,
     inputs: list[fx.Node],
     outputs: list[fx.Node],
+    outputs_descs: list[AOTOutput],
     subgraph: Optional[str] = None,
+    ignore_must_be_in_fw_bw: bool = False,
 ) -> fx.Graph:
     """
     Given a graph, extracts out a subgraph that takes the specified nodes as
@@ -195,12 +203,26 @@ def _extract_graph_with_inputs_outputs(
         new_node = new_graph.placeholder(node.name)
         # Can't use node_copy here as we may be turning previous call_function into placeholders
         new_node.meta = node.meta
+        # pyrefly: ignore [unsupported-operation]
         env[node] = new_node
 
     for node in joint_graph.nodes:
-        if _must_be_in_backward(node) and subgraph != "backward":
-            env[node] = InvalidNode  # type: ignore[assignment]
-            continue
+        if not ignore_must_be_in_fw_bw:
+            if (
+                _must_be_in_backward(node)
+                and subgraph != "backward"
+                and node not in inputs
+            ):
+                env[node] = InvalidNode  # type: ignore[assignment]
+                continue
+
+            if (
+                _must_be_in_forward(node)
+                and subgraph != "forward"
+                and node not in inputs
+            ):
+                env[node] = InvalidNode  # type: ignore[assignment]
+                continue
 
         if node in env:
             # Node must be one of our inputs. (Any member of env which wasn't an
@@ -219,8 +241,10 @@ def _extract_graph_with_inputs_outputs(
             if any(all_args):
                 env[node] = InvalidNode  # type: ignore[assignment]
                 continue
+            # pyrefly: ignore [unsupported-operation, bad-argument-type]
             env[node] = new_graph.node_copy(node, lambda x: env[x])
         elif node.op == "get_attr":
+            # pyrefly: ignore [unsupported-operation, bad-argument-type]
             env[node] = new_graph.node_copy(node, lambda x: env[x])
         elif node.op == "output":
             pass
@@ -235,7 +259,8 @@ def _extract_graph_with_inputs_outputs(
             output_values.append(env[x])
         else:
             output_values.append(x)
-    new_graph.output(tuple(output_values))
+    out = new_graph.output(tuple(output_values))
+    out.meta["desc"] = outputs_descs
 
     new_graph.eliminate_dead_code()
     new_graph.lint()
@@ -275,25 +300,58 @@ def _has_tag_is_backward(node: fx.Node) -> bool:
     return node.meta.get("partitioner_tag", None) == "is_backward"
 
 
+def _has_tag_is_forward(node: fx.Node) -> bool:
+    return node.meta.get("partitioner_tag", None) == "is_forward"
+
+
+def _has_tag_must_be_in_forward(node: fx.Node) -> bool:
+    return node.meta.get("partitioner_tag", None) == "must_be_in_forward"
+
+
 def _has_tag_must_be_in_backward(node: fx.Node) -> bool:
     return node.meta.get("partitioner_tag", None) == "must_be_in_backward"
 
 
-def _must_be_in_backward(node: fx.Node) -> bool:
-    return _has_tag_must_be_in_backward(node) or (
-        _has_tag_is_backward(node) and is_with_effects(node)
+def _must_be_in_forward(node: fx.Node) -> bool:
+    if _has_tag_must_be_in_forward(node):
+        return True
+    is_mutable = is_with_effects(node) or (
+        isinstance(node.target, torch._ops.OpOverload)
+        and node.target._schema.is_mutable
     )
+    return (
+        not _has_tag_is_backward(node)
+        and not _has_tag_must_be_in_backward(node)
+        and is_mutable
+    )
+
+
+def _must_be_in_backward(node: fx.Node) -> bool:
+    if _has_tag_must_be_in_backward(node):
+        return True
+    is_mutable = is_with_effects(node) or (
+        isinstance(node.target, torch._ops.OpOverload)
+        and node.target._schema.is_mutable
+    )
+    return _has_tag_is_backward(node) and is_mutable
 
 
 def _extract_fwd_bwd_outputs(
     joint_module: fx.GraphModule, *, num_fwd_outputs
-) -> tuple[list[fx.Node], list[fx.Node]]:
+) -> tuple[list[fx.Node], list[fx.Node], list[AOTOutput], list[AOTOutput]]:
     outputs = pytree.arg_tree_leaves(
         *(node.args for node in joint_module.graph.find_nodes(op="output"))
     )
+    outputs_descs = pytree.arg_tree_leaves(
+        next(iter(joint_module.graph.find_nodes(op="output"))).meta.get(
+            "desc", [None] * len(outputs)
+        )
+    )
     fwd_outputs = outputs[:num_fwd_outputs]
     bwd_outputs = outputs[num_fwd_outputs:]
-    return fwd_outputs, bwd_outputs
+    fwd_outputs_descs = outputs_descs[:num_fwd_outputs]
+    bwd_outputs_descs = outputs_descs[num_fwd_outputs:]
+    return fwd_outputs, bwd_outputs, fwd_outputs_descs, bwd_outputs_descs
 
 
 def _remove_by_name(saved_values: list[fx.Node], name: str):
@@ -319,6 +377,7 @@ def calculate_quantization_scaling(
     node: torch.fx.Node,
     max: float = 57344.0,
     min: float = 1e-12,
+    position: int = 0,
 ):
     with graph.inserting_after(node):
         abs_node = graph.call_function(
@@ -382,7 +441,7 @@ def calculate_quantization_scaling(
         scale_node = graph.call_function(
             torch.ops.prims.convert_element_type.default,
             args=(mul_node, torch.float32),
-            name="fp8_scale_" + str(node.name),
+            name=f"fp8_scale_pos_{position}_{node.name}",
         )
         scale_node.meta["val"] = torch.ops.prims.convert_element_type.default(
             mul_node.meta["val"], torch.float32
@@ -398,6 +457,7 @@ def perform_quantization(
     quant_type: torch.dtype,
     clamp_min: float,
     clamp_max: float,
+    position: int,
 ) -> torch.fx.Node:
     with graph.inserting_after(scale_node):
         target_node_32 = graph.call_function(
@@ -447,7 +507,7 @@ def perform_quantization(
         quant_activation_node = graph.call_function(
             torch.ops.prims.convert_element_type.default,
             args=(clamp_max_scaled_node, quant_type),
-            name="fp8_quant_" + str(node.name),
+            name=f"fp8_quant_pos_{position}_{node.name}",
         )
         quant_activation_node.meta["val"] = (
             torch.ops.prims.convert_element_type.default(
@@ -501,7 +561,7 @@ def should_quantize(node: torch.fx.Node) -> bool:
     ].get("skip_dynamo_guards", False):
         return size_in_mb >= size_threshold
     else:
-        # case 1: we alway quantize tensors with dynamic shapes
+        # case 1: we always quantize tensors with dynamic shapes
         if torch._inductor.config.post_grad_fusion_options[
             "activation_quantization_aten_pass"
         ].get("quantize_dynamic_shape", False):
@@ -509,7 +569,7 @@ def should_quantize(node: torch.fx.Node) -> bool:
                 size_in_mb >= size_threshold
             ) or not statically_known_false(size_in_mb >= size_threshold)
         else:
-            # case 2: we alway not quantize tensors with dynamic shapes
+            # case 2: we always not quantize tensors with dynamic shapes
             return statically_known_true(size_in_mb >= size_threshold)
 
 
@@ -538,9 +598,9 @@ def quantize_activation_fw(graph: torch.fx.Graph) -> None:
     fwd_outputs = output.args[0]
     quant_type = get_quant_type()
     clamp_min, clamp_max = calculate_range(quant_type)
-    node_to_quant = dict()
+    position_to_quant = dict()
     tensor_scale_nodes, sym_scale_nodes = [], []
-    for node in fwd_outputs:
+    for position, node in enumerate(fwd_outputs):
         # check if the activation node is the node saved for quantization
         if node.meta.get("saved_for_quantization", False):
             # case: use scaling
@@ -549,11 +609,12 @@ def quantize_activation_fw(graph: torch.fx.Graph) -> None:
             ].get("use_scaling", True):
                 # calculating the scale
                 scale_node = calculate_quantization_scaling(
-                    graph, node, clamp_max, 1e-12
+                    graph, node, clamp_max, 1e-12, position
                 )
+
                 # converting to fp8
                 quant_node = perform_quantization(
-                    graph, node, scale_node, quant_type, clamp_min, clamp_max
+                    graph, node, scale_node, quant_type, clamp_min, clamp_max, position
                 )
                 if not is_sym_node(scale_node):
                     tensor_scale_nodes.append(scale_node)
@@ -565,7 +626,7 @@ def quantize_activation_fw(graph: torch.fx.Graph) -> None:
                     quant_node = graph.call_function(
                         torch.ops.prims.convert_element_type.default,
                         args=(node, quant_type),
-                        name="fp8_quant_" + str(node.name),
+                        name=f"fp8_quant_pos_{position}_{node.name}",
                     )
                     quant_node.meta["val"] = (
                         torch.ops.prims.convert_element_type.default(
@@ -575,12 +636,16 @@ def quantize_activation_fw(graph: torch.fx.Graph) -> None:
                     quant_node.meta["tensor_meta"] = extract_tensor_metadata(
                         quant_node.meta["val"]
                     )
-            node_to_quant[node] = quant_node
+
+            position_to_quant[position] = quant_node
+
+    # Use position-based lookup for building output
     # only update the return node args, and remain all other users unchanged
     output_updated_args = [
-        node_to_quant[node] if node in node_to_quant else node for node in fwd_outputs
+        position_to_quant.get(i, node) for i, node in enumerate(fwd_outputs)
     ]
-    # add the scale nodes to the ouput find the first sym_node in the output
+    # add the scale nodes to the output find the first sym_node in the output
+    # pyrefly: ignore [bad-argument-type]
     idx = find_first_sym_node(output_updated_args)
     scale_nodes = tensor_scale_nodes + sym_scale_nodes
     if scale_nodes:
@@ -672,47 +737,11 @@ def quantize_activation_bw(graph: torch.fx.Graph) -> None:
     counters["inductor"]["activation_quantization_bwd_aten_pass"] += 1
 
 
-def enable_activation_quantization(
-    saved_values: list[fx.Node],
+def perform_fp8_activation_quantization(
     fwd_module: fx.GraphModule,
     bwd_module: fx.GraphModule,
-    static_lifetime_input_nodes: Optional[OrderedSet[fx.Node]] = None,
+    bwd_module_inputs: dict[str, fx.Node],
 ) -> None:
-    if (
-        inductor_config.post_grad_fusion_options.get(
-            "activation_quantization_aten_pass", None
-        )
-        is None
-    ):
-        return
-
-    static_input_names = (
-        [node.name for node in static_lifetime_input_nodes]
-        if static_lifetime_input_nodes
-        else []
-    )
-    saved_values_names = {node.name: node for node in saved_values}
-    if torch._inductor.config.post_grad_fusion_options[
-        "activation_quantization_aten_pass"
-    ].get("exclude_primals", False):
-        saved_values_names = {
-            node.name: node for node in saved_values if "primals" not in node.name
-        }
-    fwd_module_outputs = fwd_module.graph.find_nodes(op="output")[0].args[0]
-    bwd_module_inputs = {
-        node.name: node for node in bwd_module.graph.find_nodes(op="placeholder")
-    }
-    for node in fwd_module_outputs:
-        if node.name in saved_values_names and should_quantize(node):
-            if node.name in static_input_names:
-                log.debug("Skipping quantization of static input %s: ", node.name)
-                continue
-            node.meta["saved_for_quantization"] = True
-            node.meta["dequant_type"] = node.meta["val"].dtype
-            # some of the fwd outputs and bwd inputs are not share the same object
-            bwd_module_inputs[node.name].meta["saved_for_quantization"] = True
-            bwd_module_inputs[node.name].meta["dequant_type"] = node.meta["val"].dtype
-
     trace_structured(
         "artifact",
         metadata_fn=lambda: {
@@ -752,7 +781,9 @@ def enable_activation_quantization(
     # update the corresponding bwd_inputs due to the fwd_outputs quantization
     for fwd_node in quant_fwd_module_outputs:
         if "fp8_quant_" in fwd_node.name:
-            bwd_input = bwd_module_inputs[fwd_node.name.replace("fp8_quant_", "")]
+            bwd_input = bwd_module_inputs[
+                re.sub(r"^fp8_quant_pos_\d+_", "", fwd_node.name)
+            ]
             with bwd_module.graph.inserting_after(bwd_input):
                 quant_bwd_input = bwd_module.graph.placeholder(name=fwd_node.name)
             dequant_type = bwd_input.meta["dequant_type"]
@@ -796,6 +827,53 @@ def enable_activation_quantization(
     )
 
 
+def enable_activation_quantization(
+    saved_values: list[fx.Node],
+    fwd_module: fx.GraphModule,
+    bwd_module: fx.GraphModule,
+    static_lifetime_input_nodes: Optional[OrderedSet[fx.Node]] = None,
+) -> None:
+    if (
+        inductor_config.post_grad_fusion_options.get(
+            "activation_quantization_aten_pass", None
+        )
+        is None
+    ):
+        return
+
+    static_input_names = (
+        [node.name for node in static_lifetime_input_nodes]
+        if static_lifetime_input_nodes
+        else []
+    )
+    saved_values_names = {node.name: node for node in saved_values}
+    if torch._inductor.config.post_grad_fusion_options[
+        "activation_quantization_aten_pass"
+    ].get("exclude_primals", False):
+        saved_values_names = {
+            node.name: node for node in saved_values if "primals" not in node.name
+        }
+    fwd_module_outputs = fwd_module.graph.find_nodes(op="output")[0].args[0]
+    bwd_module_inputs = {
+        node.name: node for node in bwd_module.graph.find_nodes(op="placeholder")
+    }
+    should_perform_fp8_quant = False
+    for node in fwd_module_outputs:
+        if node.name in saved_values_names and should_quantize(node):
+            if node.name in static_input_names:
+                log.debug("Skipping quantization of static input %s: ", node.name)
+                continue
+            node.meta["saved_for_quantization"] = True
+            node.meta["dequant_type"] = node.meta["val"].dtype
+            # some of the fwd outputs and bwd inputs are not share the same object
+            bwd_module_inputs[node.name].meta["saved_for_quantization"] = True
+            bwd_module_inputs[node.name].meta["dequant_type"] = node.meta["val"].dtype
+            should_perform_fp8_quant = True
+
+    if should_perform_fp8_quant:
+        perform_fp8_activation_quantization(fwd_module, bwd_module, bwd_module_inputs)
+
+
 def _extract_fwd_bwd_modules(
     joint_module: fx.GraphModule,
     saved_values: list[fx.Node],
@@ -804,8 +882,8 @@ def _extract_fwd_bwd_modules(
     num_fwd_outputs: int,
     static_lifetime_input_nodes: Optional[OrderedSet[fx.Node]] = None,
 ) -> tuple[fx.GraphModule, fx.GraphModule]:
-    fwd_outputs, bwd_outputs = _extract_fwd_bwd_outputs(
-        joint_module, num_fwd_outputs=num_fwd_outputs
+    fwd_outputs, bwd_outputs, fwd_outputs_descs, bwd_outputs_descs = (
+        _extract_fwd_bwd_outputs(joint_module, num_fwd_outputs=num_fwd_outputs)
     )
     placeholders = joint_module.graph.find_nodes(op="placeholder")
     primal_inputs = [*filter(_is_primal, placeholders)]
@@ -818,6 +896,7 @@ def _extract_fwd_bwd_modules(
         joint_module.graph,
         saved_sym_nodes + saved_values + tangent_inputs + bwd_seed_offset_inputs,
         bwd_outputs,
+        bwd_outputs_descs,
         "backward",
     )
 
@@ -891,6 +970,11 @@ def _extract_fwd_bwd_modules(
         joint_module.graph,
         primal_inputs + fwd_seed_offset_inputs,
         fwd_outputs + saved_values + saved_sym_nodes,
+        fwd_outputs_descs
+        + [
+            SavedForBackwardsAOTOutput(i)
+            for i in range(len(saved_values) + len(saved_sym_nodes))
+        ],
         "forward",
     )
     bwd_graph = _extract_graph_with_inputs_outputs(
@@ -901,6 +985,7 @@ def _extract_fwd_bwd_modules(
         + bwd_seed_offset_inputs
         + backward_state_inputs,
         bwd_outputs,
+        bwd_outputs_descs,
         "backward",
     )
 
@@ -943,68 +1028,173 @@ def default_partition(
     Returns:
         Returns the generated forward and backward Fx graph modules.
     """
-    if has_recomputable_ops(joint_module):
-        return min_cut_rematerialization_partition(
-            joint_module,
-            _joint_inputs,
-            num_fwd_outputs=num_fwd_outputs,
-            static_lifetime_input_indices=static_lifetime_input_indices,
-        )
-    primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
-    fwd_seed_offset_inputs = list(filter(_is_fwd_seed_offset, joint_module.graph.nodes))
-    inputs = primal_inputs + fwd_seed_offset_inputs
-    fwd_outputs, bwd_outputs = _extract_fwd_bwd_outputs(
-        joint_module, num_fwd_outputs=num_fwd_outputs
-    )
-    forward_only_graph = _extract_graph_with_inputs_outputs(
-        joint_module.graph, inputs, fwd_outputs, "forward"
-    )
+    # Respect the original placement of ops rather than rely on dataflow.
+    forward_nodes = []
+    last_node = None
+    for node in joint_module.graph.nodes:
+        if _has_tag_is_forward(node) or _is_primal(node) or _is_fwd_seed_offset(node):
+            last_node = node
+    assert last_node is not None
+    for node in joint_module.graph.nodes:
+        if not _is_tangent(node):
+            forward_nodes.append(node)
+        if node is last_node:
+            break
     forward_node_names = OrderedSet(
-        node.name for node in forward_only_graph.nodes if node.op != "output"
+        node.name for node in forward_nodes if node.op != "output"
     )
+    graph_has_recomputable_ops = has_recomputable_ops(joint_module)
+    graph_has_recomputable_rng_ops = has_recomputable_rng_ops(joint_module)
+    if graph_has_recomputable_ops:
+        if _is_functional_graph(joint_module.graph)[0] is not None:
+            # Fall-back to previous behavior to avoid bc-breaking, although can
+            # eventually flip the switch to make this a hard error.
+            warnings.warn(
+                "Trying to unsafely apply AC to a non-functional graph with the "
+                "default partitioner. Falling back to min-cut partitioner."
+            )
+            return min_cut_rematerialization_partition(
+                joint_module,
+                _joint_inputs,
+                num_fwd_outputs=num_fwd_outputs,
+                static_lifetime_input_indices=static_lifetime_input_indices,
+            )
+
+        joint_module = cleanup_recompute_tags(joint_module, is_default_partition=True)
+
+    if not config.unsafe_allow_optimization_of_collectives:
+        force_save_collectives(joint_module)
+
+    force_save_bw_mutation_src(joint_module)
+
+    if static_lifetime_input_indices is None:
+        static_lifetime_input_indices = []
+    node_info = classify_nodes(
+        joint_module, static_lifetime_input_indices, num_fwd_outputs
+    )
+
     saved_values = []
     saved_sym_nodes = []
 
+    distributed_enabled = torch.distributed.is_available()
+
+    def is_tensor(node):
+        return "tensor_meta" in node.meta or isinstance(
+            node.meta.get("val"), torch._subclasses.FakeTensor
+        )
+
+    def is_multi_output(node):
+        return (
+            all(user.target == operator.getitem for user in node.users)
+            and len(node.users) > 0
+        )
+
+    def is_impure(node):
+        # wait tensor is an "impure" op according to DCE's definition of impure
+        # (see is_impure in torch/fx/node.py), but it survives past
+        # functionalization and can be safely dup'd and reordered under the
+        # assumption SPMD.
+        return (
+            node.is_impure(impure_random=False)
+            and node.op
+            not in (
+                "placeholder",
+                "output",
+            )
+            and (
+                not distributed_enabled
+                or node.target is not torch.ops._c10d_functional.wait_tensor.default
+            )
+        )
+
     for node in joint_module.graph.nodes:
         if node.name not in forward_node_names:
+            continue
+        if node.target is torch.ops.aten._assert_scalar.default:
             continue
         if is_sym_node(node):
             # Symints must be kept separate from tensors so that PythonFunction only calls
             # save_for_backward on tensors and stashes symints in autograd .ctx
             saved_sym_nodes.append(node)
-        elif "tensor_meta" not in node.meta and node.op == "call_function":
-            # Since we can't save tuple of tensor values, we need to flatten out what we're saving
-            users = node.users
-            assert all(user.target == operator.getitem for user in users)
-            saved_values.extend(users)
-        else:
-            backward_usages = [
-                n for n in node.users if n.name not in forward_node_names
-            ]
-            if "tensor_meta" in node.meta and all(
-                is_sym_node(n) for n in backward_usages
-            ):
-                # If we have a tensor in the forward, where only its sizes/strides are needed in the backward,
-                # and not the actual tensor data,
-                # then it will be a lot cheaper to save only the sizes/strides, and not the actual tensor.
-                #
-                # Note that saving the tensor could also cause compilation problems:
-                # If the user mutated an input in the forward and uses its sizes/strides in the backward,
-                # then we would be obligated to clone the input before saving it to appease autograd.
-                # (This is how we originally found this bug).
-                saved_sym_nodes.extend(backward_usages)
-            else:
-                saved_values.append(node)
+            continue
+        if is_multi_output(node):
+            # Must be ordered before MUST_SAVE tags to avoid saving tuples marked MUST_SAVE.
+            continue
+        if node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE:
+            saved_values.append(node)
+            continue
+        if is_impure(node):
+            assert not graph_has_recomputable_ops, (
+                "Trying to apply AC on a graph with impure op",
+                node,
+                node.target,
+            )
+            saved_values.append(node)
+            continue
+        assert is_tensor(node) or node.op != "call_function", (
+            f"Expected {node} to be a tensor"
+        )
+        backward_usages = [n for n in node.users if n.name not in forward_node_names]
+        if all(is_sym_node(n) for n in backward_usages):
+            # If we have a tensor in the forward, where only its sizes/strides are needed in the backward,
+            # and not the actual tensor data,
+            # then it will be a lot cheaper to save only the sizes/strides, and not the actual tensor.
+            #
+            # Note that saving the tensor could also cause compilation problems:
+            # If the user mutated an input in the forward and uses its sizes/strides in the backward,
+            # then we would be obligated to clone the input before saving it to appease autograd.
+            # (This is how we originally found this bug).
+            saved_sym_nodes.extend(backward_usages)
+            continue
+        if not must_recompute(node):
+            saved_values.append(node)
+
     saved_values = list(dict.fromkeys(saved_values).keys())
     saved_sym_nodes = list(dict.fromkeys(saved_sym_nodes).keys())
 
-    return _extract_fwd_bwd_modules(
+    if config._sync_decision_cross_ranks:
+        saved_values = _sync_decision_cross_ranks(joint_module.graph, saved_values)
+
+    if static_lifetime_input_nodes is None:
+        static_lifetime_input_nodes = node_info.static_lifetime_input_nodes
+    fw_module, bw_module = _extract_fwd_bwd_modules(
         joint_module,
         saved_values,
         saved_sym_nodes=saved_sym_nodes,
         num_fwd_outputs=num_fwd_outputs,
         static_lifetime_input_nodes=static_lifetime_input_nodes,
     )
+
+    # Run DCE while overriding the definition of is_impure_node
+    def is_not_collective(node):
+        if not distributed_enabled:
+            return True
+        if node.target is torch.ops._c10d_functional.wait_tensor.default:
+            return False
+        if node.target is torch.ops._c10d_functional.all_gather_into_tensor.default:
+            return False
+        return True
+
+    fw_module.graph.eliminate_dead_code(is_impure_node=is_not_collective)
+    bw_module.graph.eliminate_dead_code(is_impure_node=is_not_collective)
+
+    if graph_has_recomputable_ops:
+        if graph_has_recomputable_rng_ops:
+            fw_module, bw_module = functionalize_rng_ops(
+                joint_module, fw_module, bw_module, len(saved_sym_nodes)
+            )
+        bw_module = reordering_to_mimic_autograd_engine(bw_module)
+
+    # raise all getitem ops to as early as possible
+    # this is helpful for memory, especially in the case of aot_eager backend
+    fw_module = raise_getitems(fw_module)
+    bw_module = raise_getitems(bw_module)
+
+    fw_module = thread_graphsafe_rng_from_hops(fw_module, is_backward=False)
+    if len(node_info.required_bw_nodes) > 0:
+        bw_module = thread_graphsafe_rng_from_hops(bw_module, is_backward=True)
+
+    return fw_module, bw_module
 
 
 INT_INF = int(1e6)
@@ -1082,7 +1272,7 @@ def reordering_to_mimic_autograd_engine(gm: fx.GraphModule) -> fx.GraphModule:
     """
     This pass finds the first bwd node in the graph (by looking at users of
     tangents) and then reorders the graph by walking from this node to all the
-    way to the end of the graph. At each op in this traveral, we insert this op
+    way to the end of the graph. At each op in this traversal, we insert this op
     in a new graph and try to bring only the relevant subgraph from the other
     non-bwd edges relevant for this op. This closely mimics the behavior of
     autograd engine.
@@ -1123,6 +1313,7 @@ def reordering_to_mimic_autograd_engine(gm: fx.GraphModule) -> fx.GraphModule:
             # critical path first.
             cur_nodes += node.all_input_nodes
 
+        # pyrefly: ignore [bad-assignment]
         insertable_nodes = sorted(insertable_nodes, key=lambda n: order[n])
         for node in insertable_nodes:
             env[node] = new_graph.node_copy(node, lambda x: env[x])
@@ -1144,7 +1335,7 @@ def reordering_to_mimic_autograd_engine(gm: fx.GraphModule) -> fx.GraphModule:
     # Build the graph op-by-op by starting from the node all the way to the end
     # copy_ can be not using tangents at all, we must copy it.
     for node in list(gm.graph.nodes)[: order[first_node_in_bwd]]:
-        if node.op == "call_function" and node.target == torch.ops.aten.copy_.default:
+        if node.op == "call_function" and node.target is torch.ops.aten.copy_.default:
             insert_node_in_graph(node)
 
     for node in list(gm.graph.nodes)[order[first_node_in_bwd] :]:
@@ -1305,9 +1496,14 @@ def functionalize_rng_ops(
         return torch.device("cpu")
 
     def get_sample_rng_state(device: Optional[torch.device]):
-        if device is not None and device.type == "cuda":
-            return torch.cuda.get_rng_state()
-        return torch.get_rng_state()
+        from torch._guards import detect_fake_mode  # noqa: F401
+
+        fake_mode = detect_fake_mode()
+        assert fake_mode is not None
+        with fake_mode:
+            if device is not None and device.type == "cuda":
+                return fake_mode.from_tensor(torch.cuda.get_rng_state())
+            return fake_mode.from_tensor(torch.get_rng_state())
 
     # Step 1 - Construct a mapping of rng node between the fwd and its counterpart in bwd.
     joint_graph_rng_ops = get_rng_ops(joint_module)
@@ -1346,12 +1542,14 @@ def functionalize_rng_ops(
     devices = OrderedSet(
         get_device(node_pair["fwd"]) for node_pair in recomputable_rng_ops_map.values()
     )
+    # pyrefly: ignore [unbound-name]
     devices.discard(torch.device("cpu"))
-    # multiple cuda devices wont work with cudagraphs anyway,
+    # multiple cuda devices won't work with cudagraphs anyway,
     # fallback to non graphsafe rng checkpointing
     multi_cuda_devices = len(devices) > 1
 
     # this changes numerics, so if fallback_random is set we will not use it
+    # pyrefly: ignore [unbound-name]
     ind_config = torch._inductor.config
     use_rng_graphsafe_rng_functionalization = (
         config.graphsafe_rng_functionalization
@@ -1362,9 +1560,7 @@ def functionalize_rng_ops(
         )
     )
 
-    for rng_count, (base_node, node_pair) in enumerate(
-        recomputable_rng_ops_map.items()
-    ):
+    for rng_count, node_pair in enumerate(recomputable_rng_ops_map.values()):
         # Step 2 - Modify the fwd pass such that
         fw_node = node_pair["fwd"]
         bw_node = node_pair["bwd"]
@@ -1402,6 +1598,8 @@ def functionalize_rng_ops(
                     args=(functional_fw_node, 0),
                     kwargs={},
                 )
+                state.meta["val"] = get_sample_rng_state(device)
+
                 rng_output = fw_graph.create_node(
                     "call_function",
                     operator.getitem,
@@ -1411,6 +1609,9 @@ def functionalize_rng_ops(
                     ),
                     kwargs={},
                 )
+                # Copy the meta data from the original node
+                rng_output.meta = copy.copy(fw_node.meta)
+
                 fw_node.replace_all_uses_with(rng_output)
                 fw_graph.erase_node(fw_node)
                 fw_rng_state_outputs.append(state)
@@ -1466,7 +1667,39 @@ def force_save_collectives(joint_module: fx.GraphModule) -> None:
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
 
 
-def cleanup_recompute_tags(joint_module: fx.GraphModule) -> fx.GraphModule:
+def force_save_bw_mutation_src(joint_module: fx.GraphModule) -> None:
+    # If we have mutations of the same primal in forward and backward,
+    # We must not recompute the source of mutation to not apply twice.
+    has_mutation_in_bw: OrderedSet[torch.fx.Node] = OrderedSet()
+    for node in reversed(joint_module.graph.nodes):
+        if node.op == "output":
+            continue
+
+        is_copy_ = node.target is torch.ops.aten.copy_.default
+        if is_copy_:
+            if _has_tag_must_be_in_backward(node):
+                has_mutation_in_bw.add(node.args[0])
+
+            if _has_tag_must_be_in_forward(node) and node.args[0] in has_mutation_in_bw:
+                node.args[1].meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        else:
+            # We use invariant of aotdispatch joint graph,
+            # That we emit copy_ only in the end of it.
+            # We do not want to iterate through all the joint graph,
+            # so break at the first non-output, non-copy_ node.
+            break
+
+
+def is_getitem_of_multi_output(node):
+    if node.target != operator.getitem:
+        return False
+    parent = node.args[0]
+    return "tensor_meta" not in parent.meta and node.op == "call_function"
+
+
+def cleanup_recompute_tags(
+    joint_module: fx.GraphModule, *, is_default_partition: bool
+) -> fx.GraphModule:
     """
     If there are two consecutive checkpointed blocks with no operator in
     between, we would still want to stash the tensor at the boundary of
@@ -1478,6 +1711,8 @@ def cleanup_recompute_tags(joint_module: fx.GraphModule) -> fx.GraphModule:
             for user in node.users:
                 if (
                     must_recompute(user)
+                    and "ac_graph_id" in user.meta
+                    and "ac_graph_id" in node.meta
                     and user.meta["ac_graph_id"] > node.meta["ac_graph_id"]
                 ):
                     node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
@@ -1501,6 +1736,20 @@ def cleanup_recompute_tags(joint_module: fx.GraphModule) -> fx.GraphModule:
                 # Solution: check whether `out` has a backward hook, and if so, intentionally save `out`
                 # in forward graph outputs. With this, we can break the above circular dependency.
                 node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        elif (
+            "ac_graph_id" not in node.meta
+            and any(must_recompute(user) for user in node.users)
+            and not (
+                # Avoid saving getitem nodes which are not labeled with "ac_graph_id"
+                is_getitem_of_multi_output(node) and "ac_graph_id" in node.args[0].meta
+            )
+            and is_default_partition
+        ):
+            # This node is not part of the AC region and a user is marked as recompute.
+            # This means it's an input to the AC region and we should save it.
+            # For ease of landing, gate this to default partitioner only, but we should think
+            # about flipping the switch in general as well.
+            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
     return joint_module
 
 
@@ -1595,7 +1844,7 @@ def solve_min_cut(
     def should_ban_recomputation(node):
         if node.op != "call_function":
             return False
-        if node.target == operator.getitem:
+        if node.target is operator.getitem:
             return False
         if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:
             return True
@@ -1719,7 +1968,7 @@ def solve_min_cut(
             # If someone saves a input for backward as-is and backward
             # returns that tensor as-is as a grad input, then the node x would
             # be both a required_bw_node and an input. In this case we
-            # (1) connect x_in to to the source, (2) x_out to the sink, and
+            # (1) connect x_in to the source, (2) x_out to the sink, and
             # (3) assign the proper weight to the x_in-x_out edge, so that
             # x would be part of cut nodes. A case where this happens is if
             # NestedTensor saves a offset tensor as part of the singleton int
@@ -2117,6 +2366,8 @@ def _optimize_runtime_with_given_memory(
         return ilp_knapsack(memory, runtimes, max_memory)
     elif SOLVER == "dp":
         return dp_knapsack(memory, runtimes, max_memory)
+    elif SOLVER == "dp_knapsack_sliding_hirschberg":
+        return dp_knapsack_sliding_hirschberg(memory, runtimes, max_memory)
     elif SOLVER == "dynamic_memory_budget_dp":
         log.warning(
             "dynamic_memory_budget_dp is an experimental solver. "
@@ -2342,7 +2593,7 @@ def choose_saved_values_set(
             # if idx in all_recomputable_banned_nodes:
             try:
                 dont_ban.add(all_recomputable_banned_nodes[idx])
-            except BaseException:
+            except BaseException:  # noqa: B036
                 pass
 
         assert dont_ban.issubset(all_recomputable_banned_nodes)
@@ -2360,7 +2611,10 @@ def choose_saved_values_set(
                 saved_node_idxs=saved_node_idxs,
                 recomputable_node_idxs=recomputable_node_idxs,
                 expected_runtime=expected_runtime,
-                memories_banned_nodes=memories_banned_nodes,
+                memories_banned_nodes=[
+                    _size_of(i) for i in all_recomputable_banned_nodes
+                ],
+                normalized_memories_banned_nodes=memories_banned_nodes,
                 runtimes_banned_nodes=runtimes_banned_nodes,
                 min_cut_saved_values=saved_values,
             )
@@ -2444,7 +2698,7 @@ def choose_saved_values_set(
     )[0]
 
 
-def _broadcast_rank0_decision(
+def _sync_decision_cross_ranks(
     joint_graph: torch.fx.Graph, saved_values: list[torch.fx.Node]
 ):
     # use the same policy across different GPUs
@@ -2462,7 +2716,7 @@ def _broadcast_rank0_decision(
         # proxy to check if the graph is the same across different GPUs.
         # We only consider the name and order of nodes. A more robust way
         # would be to check the hash of the whole graph (disregarding input shapes),
-        # this is is a reasonable first-order approximation.
+        # this is a reasonable first-order approximation.
         node_str = "/".join(x.name for x in joint_graph.nodes)
         inputs = hashlib.sha256(node_str.encode("utf-8")).hexdigest()
         all_inputs = [None for _ in range(torch.distributed.get_world_size())]
@@ -2480,12 +2734,182 @@ def _broadcast_rank0_decision(
     ):
         with no_dispatch(), unset_fake_temporarily():
             objects = [[x.name for x in saved_values]]
-            # TODO: maybe use a different process group for this
-            torch.distributed.broadcast_object_list(objects, src=0)
-            saved_values_names = objects[0]
+            saved_ops_names_all_ranks: list[list[str]] = [
+                [] for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather_object(saved_ops_names_all_ranks, objects[0])
             name_to_node = get_name_to_node(joint_graph)
-            saved_values = [name_to_node[n] for n in saved_values_names]
+            saved_sizes: list[int] = []
+            saved_ops_with_sizes: dict[str, int] = {}
+
+            for idx, saved_ops_names in enumerate(saved_ops_names_all_ranks):
+                saved_nodes = [name_to_node[op_name] for op_name in saved_ops_names]
+                saved_size = 0
+                for node in saved_nodes:
+                    size_of_node = _size_of(node)
+                    saved_size += size_of_node
+                    if idx == torch.distributed.get_rank():
+                        saved_ops_with_sizes[node.name] = size_of_node
+                saved_ops_with_sizes["total size"] = saved_size
+                saved_sizes.append(saved_size)
+
+            saved_sizes_tensor = torch.tensor(
+                saved_sizes,
+                device=torch.distributed.distributed_c10d._get_object_coll_device(),
+            )
+            torch.distributed.all_reduce(
+                saved_sizes_tensor, op=torch.distributed.distributed_c10d.ReduceOp.MAX
+            )
+
+            picked_rank_idx = int(torch.argmin(saved_sizes_tensor).item())
+            sync_decision_cross_ranks_str = f"picked_rank_idx={picked_rank_idx}, saved_nodes of current rank={saved_ops_with_sizes}"
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "aot_joint_graph_sync_decision_cross_ranks",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: sync_decision_cross_ranks_str,
+            )
+
+            saved_values = [
+                name_to_node[n] for n in saved_ops_names_all_ranks[picked_rank_idx]
+            ]
+
     return saved_values
+
+
+def thread_graphsafe_rng_from_hops(module, is_backward):
+    """
+    Graph-safe RNG lets torch.compile use CUDA Graphs for graphs with RNG ops.
+    For graphs without HOPs, the partitioner adds placeholder nodes
+    fwd_rng_state_* and bw_rng_state_* to the forward and backward graphs. At
+    runtime, the AOTDispatcher retrieves these RNG states and passes them to the
+    compiled graphs.
+
+    This works well for no-HOP graphs. With HOPs, the partitioner runs
+    recursively: it first partitions the HOP (producing forward/backward HOP
+    subgraphs) and then stitches them back into the outer joint graph. For HOPs
+    that contain RNG ops, the outer joint graph now includes HOP subgraph
+    modules with extra RNG placeholders. We must thread these placeholders
+    through the outer module partitioned forward and backward graphs—this
+    function does exactly that. It collects the RNG placeholder nodes from the
+    HOPs and creates corresponding placeholders in the outer forward and
+    backward graphs.
+
+    There is a catch: for a short period, the joint graph is in a “bad” state.
+    The HOP subgraphs expect additional inputs (because of the new
+    placeholders), but the outer graph call sites don't yet provide them. We
+    can't fix this in the joint graph because the joint graph's input signature
+    is fixed (primals, tangents). As a compromise, we keep the joint graph in
+    somewhat of a bad state for some time and, once the outer forward and
+    backward graphs are partitioned, insert the corresponding RNG placeholders
+    and wire up the calls.
+    """
+
+    rng_count = 0
+    rng_string = "bwd_rng_state" if is_backward else "fwd_rng_state"
+    last_input = next(reversed(module.graph.find_nodes(op="placeholder")))
+    for hop_node in module.graph.find_nodes(
+        op="call_function", target=torch.ops.higher_order.invoke_subgraph
+    ):
+        subgraph = getattr(module, hop_node.args[0].target)
+        if isinstance(subgraph, fx.GraphModule):
+            new_rng_inputs = []
+            for placeholder_node in subgraph.graph.find_nodes(op="placeholder"):
+                if rng_string in placeholder_node.name:
+                    # Found a rng state placeholder in the hop graph, lets add
+                    # the corresponding node in the outer graph
+                    with module.graph.inserting_after(last_input):
+                        rng_state = module.graph.placeholder(
+                            f"{rng_string}_{rng_count}"
+                        )
+                        rng_count += 1
+                        rng_state.meta["val"] = placeholder_node.meta["val"]
+                        last_input = rng_state
+                        new_rng_inputs.append(rng_state)
+
+            if new_rng_inputs:
+                # Pass on the new args that include the new_rng_inputs
+                with module.graph.inserting_after(hop_node):
+                    new_hop_node_with_fixed_args = module.graph.create_node(
+                        "call_function",
+                        torch.ops.higher_order.invoke_subgraph,
+                        (*hop_node.args, *new_rng_inputs),  # type: ignore[arg-type]
+                        {},
+                    )
+                    hop_node.replace_all_uses_with(
+                        new_hop_node_with_fixed_args, propagate_meta=True
+                    )
+
+                # Setup the eager_input_vals
+                eager_vals = hop_node.meta.get("eager_input_vals")
+                if eager_vals:
+                    eager_args, eager_kwargs = eager_vals
+                    new_eager_args = (
+                        *eager_args,
+                        *[inp.meta["val"] for inp in new_rng_inputs],
+                    )
+                    new_hop_node_with_fixed_args.meta["eager_input_vals"] = (
+                        new_eager_args,
+                        eager_kwargs,
+                    )
+                module.graph.erase_node(hop_node)
+
+    return module
+
+
+def classify_nodes(joint_module, static_lifetime_input_indices, num_fwd_outputs):
+    name_to_node = get_name_to_node(joint_module.graph)
+    required_bw_nodes: OrderedSet[fx.Node] = OrderedSet()
+    for node in joint_module.graph.nodes:
+        if node.op == "placeholder" and "tangents" in node.target:
+            required_bw_nodes.add(node)
+        elif _must_be_in_backward(node):
+            required_bw_nodes.add(node)
+
+        if node in required_bw_nodes:
+            required_bw_nodes.update(node.users)
+
+    primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
+    fwd_seed_offset_inputs = list(filter(_is_fwd_seed_offset, joint_module.graph.nodes))
+    inputs = primal_inputs + fwd_seed_offset_inputs
+    fwd_outputs, bwd_outputs, fwd_outputs_descs, bwd_outputs_descs = (
+        _extract_fwd_bwd_outputs(joint_module, num_fwd_outputs=num_fwd_outputs)
+    )
+    required_bw_nodes.update(
+        o for o in bwd_outputs if o is not None and o.op != "output"
+    )
+    forward_only_graph = _extract_graph_with_inputs_outputs(
+        joint_module.graph, inputs, fwd_outputs, fwd_outputs_descs, "forward"
+    )
+    required_fw_nodes: OrderedSet[fx.Node] = OrderedSet(
+        name_to_node[node.name]
+        for node in forward_only_graph.nodes
+        if node.op != "output"
+    )
+    unclaimed_nodes: OrderedSet[fx.Node] = OrderedSet(
+        node
+        for node in joint_module.graph.nodes
+        if node not in required_fw_nodes and node not in required_bw_nodes
+    )
+    static_lifetime_input_nodes = OrderedSet(
+        p for i, p in enumerate(primal_inputs) if i in static_lifetime_input_indices
+    )
+    fw_cnt = 0
+    fw_order = {}
+    for node in joint_module.graph.nodes:
+        if node in required_fw_nodes:
+            fw_order[node] = fw_cnt
+            fw_cnt += 1
+    return NodeInfo(
+        inputs,
+        required_fw_nodes,
+        required_bw_nodes,
+        unclaimed_nodes,
+        fw_order,
+        static_lifetime_input_nodes,
+    )
 
 
 def min_cut_rematerialization_partition(
@@ -2536,67 +2960,16 @@ def min_cut_rematerialization_partition(
     graph_has_recomputable_ops = has_recomputable_ops(joint_module)
     graph_has_recomputable_rng_ops = has_recomputable_rng_ops(joint_module)
     if graph_has_recomputable_ops:
-        joint_module = cleanup_recompute_tags(joint_module)
+        joint_module = cleanup_recompute_tags(joint_module, is_default_partition=False)
     if not config.unsafe_allow_optimization_of_collectives:
         force_save_collectives(joint_module)
-
-    def classify_nodes(joint_module, static_lifetime_input_indices):
-        name_to_node = get_name_to_node(joint_module.graph)
-        required_bw_nodes: OrderedSet[fx.Node] = OrderedSet()
-        for node in joint_module.graph.nodes:
-            if node.op == "placeholder" and "tangents" in node.target:
-                required_bw_nodes.add(node)
-            elif _must_be_in_backward(node):
-                required_bw_nodes.add(node)
-
-            if node in required_bw_nodes:
-                required_bw_nodes.update(node.users)
-
-        primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
-        fwd_seed_offset_inputs = list(
-            filter(_is_fwd_seed_offset, joint_module.graph.nodes)
-        )
-        inputs = primal_inputs + fwd_seed_offset_inputs
-        fwd_outputs, bwd_outputs = _extract_fwd_bwd_outputs(
-            joint_module, num_fwd_outputs=num_fwd_outputs
-        )
-        required_bw_nodes.update(
-            o for o in bwd_outputs if o is not None and o.op != "output"
-        )
-        forward_only_graph = _extract_graph_with_inputs_outputs(
-            joint_module.graph, inputs, fwd_outputs, "forward"
-        )
-        required_fw_nodes: OrderedSet[fx.Node] = OrderedSet(
-            name_to_node[node.name]
-            for node in forward_only_graph.nodes
-            if node.op != "output"
-        )
-        unclaimed_nodes: OrderedSet[fx.Node] = OrderedSet(
-            node
-            for node in joint_module.graph.nodes
-            if node not in required_fw_nodes and node not in required_bw_nodes
-        )
-        static_lifetime_input_nodes = OrderedSet(
-            p for i, p in enumerate(primal_inputs) if i in static_lifetime_input_indices
-        )
-        fw_cnt = 0
-        fw_order = {}
-        for node in joint_module.graph.nodes:
-            if node in required_fw_nodes:
-                fw_order[node] = fw_cnt
-                fw_cnt += 1
-        return NodeInfo(
-            inputs,
-            required_fw_nodes,
-            required_bw_nodes,
-            unclaimed_nodes,
-            fw_order,
-            static_lifetime_input_nodes,
-        )
+    force_save_bw_mutation_src(joint_module)
 
     if static_lifetime_input_indices is None:
         static_lifetime_input_indices = []
-    node_info = classify_nodes(joint_module, static_lifetime_input_indices)
+    node_info = classify_nodes(
+        joint_module, static_lifetime_input_indices, num_fwd_outputs
+    )
 
     # networkx blows up on graphs with no required backward nodes
     # Since there's nothing to partition anyway, and the default partitioner can "handle"
@@ -2630,8 +3003,9 @@ def min_cut_rematerialization_partition(
         node_info,
         memory_budget=memory_budget,
     )
-    if config._broadcast_rank0_decision:
-        saved_values = _broadcast_rank0_decision(joint_graph, saved_values)
+    # pyrefly: ignore [unbound-name]
+    if config._sync_decision_cross_ranks:
+        saved_values = _sync_decision_cross_ranks(joint_graph, saved_values)
     # save_for_backward on tensors and stashes symints in autograd .ctx
     saved_sym_nodes = list(filter(is_sym_node, saved_values))
     saved_values = list(filter(lambda n: not is_sym_node(n), saved_values))
@@ -2640,6 +3014,7 @@ def min_cut_rematerialization_partition(
     fw_module, bw_module = _extract_fwd_bwd_modules(
         joint_module,
         saved_values,
+        # pyrefly: ignore [bad-argument-type]
         saved_sym_nodes=saved_sym_nodes,
         num_fwd_outputs=num_fwd_outputs,
         static_lifetime_input_nodes=node_info.static_lifetime_input_nodes,
@@ -2655,6 +3030,9 @@ def min_cut_rematerialization_partition(
     # this is helpful for memory, especially in the case of aot_eager backend
     fw_module = raise_getitems(fw_module)
     bw_module = raise_getitems(bw_module)
+
+    fw_module = thread_graphsafe_rng_from_hops(fw_module, is_backward=False)
+    bw_module = thread_graphsafe_rng_from_hops(bw_module, is_backward=True)
 
     if AOT_PARTITIONER_DEBUG:
         # Calculate sorted sizes of saved values
