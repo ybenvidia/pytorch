@@ -30,10 +30,8 @@ from torch.distributed.tensor._ops._einsum_strategy import (
     EinsumDims,
     gen_einsum_strategies,
 )
-from torch.distributed.tensor._ops.utils import (
-    register_op_strategy,
-    replicate_op_strategy,
-)
+from torch.distributed.tensor._ops.registration import register_op_strategy
+from torch.distributed.tensor._ops.utils import replicate_op_strategy
 from torch.distributed.tensor.debug import (
     _clear_fast_path_sharding_prop_cache,
     _clear_python_sharding_prop_cache,
@@ -567,9 +565,7 @@ def detect_exists_identical_opspec(*args, op, mesh, strategy_function) -> bool:
 
 class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
     @with_comms
-    @patch(
-        "torch.distributed.tensor._sharding_prop.ShardingPropagator._select_strategy"
-    )
+    @patch("torch.distributed.tensor._sharding_prop._select_min_cost_strategy")
     def test_replicate_strategy_placement(self, mock_select_strategy):
         costs_from__select_strategy = []
 
