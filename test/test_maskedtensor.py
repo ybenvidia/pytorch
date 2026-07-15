@@ -82,11 +82,12 @@ def _create_random_mask(shape, device):
 def _generate_sample_data(
     device="cpu", dtype=torch.float, requires_grad=True, layout=torch.strided
 ):
-    assert layout in {
+    if layout not in {
         torch.strided,
         torch.sparse_coo,
         torch.sparse_csr,
-    }, "Layout must be strided/sparse_coo/sparse_csr"
+    }:
+        raise AssertionError("Layout must be strided/sparse_coo/sparse_csr")
     shapes = [
         [],
         [2],
@@ -242,7 +243,14 @@ class TestBasics(TestCase):
             mask = sample.kwargs["mask"]
             mt = masked_tensor(data, mask, requires_grad=True)
 
-            new_device = torch.device("cuda") if device != "cuda" and torch.cuda.is_available() else torch.device("cpu")
+            if device == "cpu":
+                new_device = torch.device(
+                    torch.accelerator.current_accelerator().type
+                    if torch.accelerator.is_available()
+                    else "cpu"
+                )
+            else:
+                new_device = torch.device("cpu")
             mt_device = mt.to(new_device)
 
             self.assertEqual(mt_device.device.type, new_device.type)
@@ -424,7 +432,7 @@ class TestUnary(TestCase):
         fn_name = _fix_fn_name(fn_name)
         if fn_name in ["log", "log10", "log1p", "log2", "sqrt"]:
             data = data.mul(0.5).abs()
-        if fn_name in ["rsqrt"]:
+        if fn_name == "rsqrt":
             data = data.abs() + 1  # Void division by zero
         if fn_name in ["acos", "arccos", "asin", "arcsin", "logit"]:
             data = data.abs().mul(0.5).clamp(0, 1)
@@ -432,7 +440,7 @@ class TestUnary(TestCase):
             data = data.mul(0.5).clamp(-1, 1)
         if fn_name in ["acosh", "arccosh"]:
             data = data.abs() + 1
-        if fn_name in ["bitwise_not"]:
+        if fn_name == "bitwise_not":
             data = data.mul(128).to(torch.int8)
         return data, mask
 
@@ -449,7 +457,7 @@ class TestUnary(TestCase):
         mt = masked_tensor(data, mask)
         t_args = [data]
         mt_args = [mt]
-        if fn_name in ["pow"]:
+        if fn_name == "pow":
             t_args += [2.0]
             mt_args += [2.0]
         return t_args, mt_args
@@ -551,12 +559,10 @@ class TestBinary(TestCase):
         mt1 = masked_tensor(data1, mask1)
         try:
             fn(mt0, mt1)
-            raise AssertionError
+            raise AssertionError("expected ValueError")
         except ValueError as e:
-            assert (
-                "Input masks must match. If you need support for this, please open an issue on Github."
-                == str(e)
-            )
+            if str(e) != "Input masks must match. If you need support for this, please open an issue on Github.":
+                raise AssertionError(f"unexpected error message: {e}") from None
 
 class TestReductions(TestCase):
     def test_max_not_implemented(self):

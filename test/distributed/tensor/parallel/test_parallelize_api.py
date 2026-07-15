@@ -55,7 +55,7 @@ class TensorParallelAPITests(DTensorTestBase):
                 (not rank0_only)
                 or (self.rank == 0)
                 or (
-                    name not in ["net2.bias"]
+                    name != "net2.bias"
                     and not skip_rowwise_bias
                     or name not in ["bias", "net2.bias"]
                 )
@@ -65,7 +65,7 @@ class TensorParallelAPITests(DTensorTestBase):
                     dist_param.redistribute(
                         device_mesh=dist_param.device_mesh, placements=replicate
                     ).to_local(),
-                    f"{name} not equal between dist and non-dist",
+                    lambda msg: f"{msg}\n{name} not equal between dist and non-dist",
                 )
 
     def _compare_module(

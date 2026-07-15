@@ -1,8 +1,21 @@
 import ctypes
 import sys
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
+
+
+try:
+    from cuda.bindings import (  # pyrefly: ignore[missing-import]
+        driver as _cuda_bindings_driver,
+        runtime as _cuda_bindings_runtime,
+    )
+
+    _HAS_CUDA_BINDINGS = True
+except ImportError:
+    _cuda_bindings_driver = None  # type: ignore[assignment]
+    _cuda_bindings_runtime = None  # type: ignore[assignment]
+    _HAS_CUDA_BINDINGS = False
 
 # The _get_device_index has been moved to torch.utils._get_device_index
 from torch._utils import _get_device_index as _torch_get_device_index
@@ -31,7 +44,7 @@ def _get_hip_runtime_library() -> ctypes.CDLL:
     return lib
 
 
-def _get_cuda_runtime_library() -> ctypes.CDLL:
+def _get_cuda_library() -> ctypes.CDLL:
     if sys.platform == "win32":
         return ctypes.CDLL("nvcuda.dll")
     else:  # Unix-based systems
@@ -43,7 +56,7 @@ def _get_gpu_runtime_library() -> ctypes.CDLL:
     if torch.version.hip:
         return _get_hip_runtime_library()
     else:
-        return _get_cuda_runtime_library()
+        return _get_cuda_library()
 
 
 # Helper: check CUDA errors
@@ -57,6 +70,77 @@ def _check_cuda(result: int) -> None:
         err_str.value.decode() if err_str.value is not None else "Unknown CUDA error"
     )
     raise RuntimeError(f"CUDA error: {error_message}")
+
+
+def _check_cuda_bindings(result: Any) -> Any:
+    """Check a cuda.bindings (cuda-python) call result for errors.
+
+    All cuda.bindings driver/runtime calls return ``(error, *outputs)``. This
+    helper unpacks the tuple, raises on non-success, and returns the
+    outputs (``None`` for zero outputs, scalar for one, tuple otherwise).
+    """
+    if not _HAS_CUDA_BINDINGS:
+        raise RuntimeError("cuda.bindings is not available")
+    # We assume that `result`` is a return value from cuda bindings API calls.
+    # This means it is always a tuple, of length >= 1 and the first element
+    # represents the error with a `value` attribute.
+    # See also cuda-python error handling here:
+    # https://github.com/NVIDIA/cuda-python/blob/88363f8f17636ecd28772b2b8ad41a33895b41bb/
+    # cuda_bindings/cuda/bindings/_example_helpers/helper_cuda.py#L11-L31
+    err, *out = result
+    if err.value:
+        # pyrefly: ignore [missing-attribute]
+        if isinstance(err, _cuda_bindings_driver.CUresult):
+            # pyrefly: ignore [missing-attribute]
+            err2, name = _cuda_bindings_driver.cuGetErrorString(err)
+            # pyrefly: ignore [missing-attribute]
+            success = _cuda_bindings_driver.CUresult.CUDA_SUCCESS
+            # cuGetErrorString can fail and leave name NULL. cudaGetErrorString
+            # returns a fallback string for unknown runtime errors.
+            err_str = name if err2 == success else "<unknown>"
+        # pyrefly: ignore [missing-attribute]
+        elif isinstance(err, _cuda_bindings_runtime.cudaError_t):
+            # pyrefly: ignore [missing-attribute]
+            err_str = _cuda_bindings_runtime.cudaGetErrorString(err)[1]
+        else:
+            err_str = "unknown error type"
+        if isinstance(err_str, bytes):
+            err_str = err_str.decode()
+        raise RuntimeError(f"CUDA error: {err} ({err_str})")
+
+    if len(out) == 0:
+        return None
+    if len(out) == 1:
+        return out[0]
+    return out
+
+
+def _check_cuda_bindings_driver(result: Any) -> Any:
+    """Check a cuda.bindings (cuda-python) driver call result for errors.
+
+    Like ``_check_cuda_bindings`` but for the CUDA driver API, whose calls
+    return ``(CUresult, *outputs)`` and report errors via ``cuGetErrorString``.
+    """
+    if not _HAS_CUDA_BINDINGS:
+        raise RuntimeError("cuda.bindings is not available")
+    err, *out = result
+    if (
+        err
+        != _cuda_bindings_driver.CUresult.CUDA_SUCCESS  # pyrefly: ignore[missing-attribute]
+    ):
+        _, err_str = (
+            _cuda_bindings_driver.cuGetErrorString(  # pyrefly: ignore[missing-attribute]
+                err
+            )
+        )
+        if isinstance(err_str, bytes):
+            err_str = err_str.decode()
+        raise RuntimeError(f"CUDA driver error: {err} ({err_str})")
+    if len(out) == 0:
+        return None
+    if len(out) == 1:
+        return out[0]
+    return out
 
 
 def _get_hiprtc_library() -> ctypes.CDLL:
@@ -79,8 +163,8 @@ def _get_hiprtc_library() -> ctypes.CDLL:
     lib.nvrtcCreateProgram = lib.hiprtcCreateProgram  # type: ignore[attr-defined]
     lib.nvrtcDestroyProgram = lib.hiprtcDestroyProgram  # type: ignore[attr-defined]
     lib.nvrtcCompileProgram = lib.hiprtcCompileProgram  # type: ignore[attr-defined]
-    lib.nvrtcGetPTXSize = lib.hiprtcGetCodeSize  # type: ignore[attr-defined]
-    lib.nvrtcGetPTX = lib.hiprtcGetCode  # type: ignore[attr-defined]
+    lib.nvrtcGetCUBINSize = lib.hiprtcGetCodeSize  # type: ignore[attr-defined]
+    lib.nvrtcGetCUBIN = lib.hiprtcGetCode  # type: ignore[attr-defined]
     lib.nvrtcGetProgramLogSize = lib.hiprtcGetProgramLogSize  # type: ignore[attr-defined]
     lib.nvrtcGetProgramLog = lib.hiprtcGetProgramLog  # type: ignore[attr-defined]
     lib.nvrtcAddNameExpression = lib.hiprtcAddNameExpression  # type: ignore[attr-defined]
@@ -143,9 +227,9 @@ def _get_gpu_rtc_compatible_flags() -> list[str]:
 def _nvrtc_compile(
     kernel_source: str,
     kernel_name: str,
-    compute_capability: Optional[str] = None,
-    cuda_include_dirs: Optional[list] = None,
-    nvcc_options: Optional[list] = None,
+    compute_capability: str | None = None,
+    cuda_include_dirs: list | None = None,
+    nvcc_options: list | None = None,
     auto_pch: bool = False,
 ) -> tuple[bytes, str]:
     """
@@ -216,7 +300,8 @@ def _nvrtc_compile(
 
     # Enable automatic precompiled headers (CUDA 12.8+)
     if auto_pch:
-        assert str(torch.version.cuda) >= "12.8", "PCH requires CUDA 12.8+"
+        if str(torch.version.cuda) < "12.8":
+            raise AssertionError(f"PCH requires CUDA 12.8+, got {torch.version.cuda}")
         if nvcc_options is None:
             nvcc_options = []
         nvcc_options.append("--pch")
@@ -262,11 +347,11 @@ def _nvrtc_compile(
         libnvrtc.nvrtcGetProgramLog(prog, log)
         raise RuntimeError(f"Kernel compilation failed:\n{log.value.decode()}")
 
-    # Get PTX
-    ptx_size = ctypes.c_size_t()
-    check_nvrtc(libnvrtc.nvrtcGetPTXSize(prog, ctypes.byref(ptx_size)))
-    ptx = ctypes.create_string_buffer(ptx_size.value)
-    check_nvrtc(libnvrtc.nvrtcGetPTX(prog, ptx))
+    # Get binary
+    binary_size = ctypes.c_size_t()
+    check_nvrtc(libnvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(binary_size)))
+    binary = ctypes.create_string_buffer(binary_size.value)
+    check_nvrtc(libnvrtc.nvrtcGetCUBIN(prog, binary))
 
     # Get mangled name
     c_mangled_name = ctypes.c_char_p()
@@ -280,11 +365,9 @@ def _nvrtc_compile(
 
     libnvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
 
-    # For HIP, hipRTC generates raw CO binaries instead of PTX,
-    # and for some reason, ".value" causes the string to be truncated,
+    # For some reason, ".value" causes the string to be truncated,
     # likely due to the presence of '\0' in the string. So we use .raw instead.
-    ptx_bytes = ptx.raw if torch.version.hip else ptx.value
-    return ptx_bytes, mangled_name
+    return binary.raw, mangled_name
 
 
 class _CudaModule:
@@ -331,9 +414,9 @@ class _CudaKernel:
         self,
         grid: tuple[int, int, int] = (1, 1, 1),
         block: tuple[int, int, int] = (1, 1, 1),
-        args: Optional[list] = None,
+        args: list | None = None,
         shared_mem: int = 0,
-        stream: Optional[Any] = None,
+        stream: Any | None = None,
     ) -> None:
         """
         Call the compiled CUDA kernel
@@ -436,11 +519,15 @@ class _CudaKernel:
         device_props = torch.cuda.get_device_properties()
         # HIP doesn't have shared_memory_per_block_optin in device properties, so we hard-code it here
         if torch.version.hip:
-            # navi, CDNA1-CDNA3 allows a max of 64KB shared memory
-            # CDNA4 allows a max of 160KB shared memory
-            max_shared_mem = (
-                65536 if device_props.gcnArchName != "gfx950" else 160 * 1024
-            )
+            # navi, CDNA1-CDNA3 allows a max of 64KB shared memory,
+            # CDNA4 (gfx950) 160KB, and CDNA5 (gfx1250) 320KB.
+            gcn_arch = device_props.gcnArchName.split(":", 1)[0]
+            if gcn_arch == "gfx950":
+                max_shared_mem = 160 * 1024
+            elif gcn_arch == "gfx1250":
+                max_shared_mem = 320 * 1024
+            else:
+                max_shared_mem = 65536
         else:
             max_shared_mem = getattr(
                 device_props, "shared_memory_per_block_optin", 49152
@@ -468,8 +555,8 @@ class _CudaKernel:
 
 
 def _cuda_load_module(
-    ptx: Union[str, bytes], kernel_names: Optional[list[str]] = None
-) -> Union[_CudaModule, dict[str, "_CudaKernel"]]:
+    ptx: str | bytes, kernel_names: list[str] | None = None
+) -> _CudaModule | dict[str, "_CudaKernel"]:
     """
     Loads a CUDA module from PTX code and returns a module object that can access kernels.
 

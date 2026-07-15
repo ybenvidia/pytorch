@@ -16,7 +16,7 @@ import torch
 import torch._prims as prims
 import torch._prims_common as utils
 import torch.utils._pytree as pytree
-from torch import sym_float, sym_int
+from torch import sym_float, sym_int, sym_max, sym_min
 from torch._prims_common import (
     BoolLike,
     DeviceLikeType,
@@ -50,6 +50,7 @@ from torch._prims_common.wrappers import (
     elementwise_unary_scalar_wrapper,
     out_wrapper,
 )
+from torch.testing._internal.common_dtype import highest_precision_float
 
 
 # Experimental module containing prototype Python references for existing
@@ -371,11 +372,15 @@ def is_noncontiguous_supported(device):
 
 def handle_noncontiguous_outputs(input_tlist, output):
     device = None
-    from torch._subclasses.fake_tensor import FakeTensor
+    from torch._subclasses.fake_tensor import (
+        FakeTensor,
+        is_fake_tensor,
+        maybe_get_fake_device,
+    )
 
     for t in input_tlist:
-        if isinstance(t, FakeTensor):
-            device = t.fake_device
+        if is_fake_tensor(t):
+            device = maybe_get_fake_device(t)
             break
 
     if not is_noncontiguous_supported(device):
@@ -387,8 +392,9 @@ def handle_noncontiguous_outputs(input_tlist, output):
 def _broadcast_shapes(*_shapes):
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
+        guarding_hint_or_throw,
+        has_guarding_hint,
         is_nested_int,
-        size_hint,
     )
 
     backed_so = torch.fx.experimental._config.backed_size_oblivious
@@ -405,12 +411,11 @@ def _broadcast_shapes(*_shapes):
     for shape in shapes:
         if not isinstance(shape, Sequence):
             raise RuntimeError(
-                "Input shapes should be of type ints, a tuple of ints, or a list of ints, got ",
-                shape,
+                f"Input shapes should be of type ints, a tuple of ints, or a list of ints, got {shape}"
             )
 
     # Computes common shape
-    common_shape: list[Union[int, torch.SymInt]] = [
+    common_shape: list[int | torch.SymInt] = [
         1,
     ] * reduce(max, (len(shape) for shape in shapes))
     for arg_idx, shape in enumerate(shapes):
@@ -425,7 +430,7 @@ def _broadcast_shapes(*_shapes):
                     continue
             else:
                 # When backed size oblivious is used, we specialize for broadcasting
-                # if its the only way to compile the example input.
+                # if it's the only way to compile the example input.
                 # i.e: s0:1, s1:1 ==>
                 #           assert s0==s1, no specialization on ==1 or !=1.
                 #            The non-broadcast path is picked
@@ -433,9 +438,13 @@ def _broadcast_shapes(*_shapes):
                 #           specialize(s0) to be 1.
                 #      s0:4, s1:1 ==>
                 #           specialize(s1) to be 1.
-                if backed_so:
-                    a = size_hint(shape[idx], allow_none=True)
-                    b = size_hint(common_shape[idx], allow_none=True)
+                if (
+                    backed_so
+                    and has_guarding_hint(shape[idx])
+                    and has_guarding_hint(common_shape[idx])
+                ):
+                    a = guarding_hint_or_throw(shape[idx])
+                    b = guarding_hint_or_throw(common_shape[idx])
                     if a == 1 and b != 1:
                         torch._check(shape[idx] == 1)
                     if b == 1 and a != 1:
@@ -728,8 +737,10 @@ def exp2(a):
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
 )
 def fill(a: TensorLikeType, value: NumberType) -> TensorLikeType:
-    assert isinstance(a, TensorLike)
-    assert isinstance(value, Number)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
+    if not isinstance(value, Number):
+        raise AssertionError(f"value must be Number, got {type(value)}")
 
     python_type = utils.dtype_to_type(a.dtype)
     if not utils.is_weakly_lesser_type(type(value), python_type):
@@ -764,13 +775,13 @@ def floor(a):
     exact_dtype=True,
 )
 def frac(x: TensorLikeType) -> TensorLikeType:
-    trunc_x = torch.mul(torch.floor(torch.abs(x)), torch.sign(x))
-    return torch.sub(x, trunc_x)
+    return torch.sub(x, torch.trunc(x))
 
 
 # imag does not use _make_elementwise_unary_reference because it does not support out
 def imag(a: TensorLikeType) -> TensorLikeType:
-    assert isinstance(a, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
     torch._check(
         utils.is_complex_dtype(a.dtype), lambda: "imag only supports complex tensors."
     )
@@ -882,7 +893,7 @@ def log10(a):
 def log_softmax(
     a: TensorLikeType,
     dim: int,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
     result_dtype = dtype or a.dtype
     computation_dtype = utils.get_computation_dtype(result_dtype)
@@ -902,14 +913,13 @@ def logsumexp(
     if not isinstance(dim, Iterable):
         dim = (dim,)
     if self.numel() == 0:
-        # pyrefly: ignore [no-matching-overload]
         return torch.sum(torch.exp(self), dim, keepdim).log()
-    # pyrefly: ignore [bad-argument-type]
+
     maxes = torch.amax(torch.real(self), dim, keepdim=True)
     maxes = torch.masked_fill(maxes, maxes.abs() == float("inf"), 0)
-    # pyrefly: ignore [no-matching-overload]
+
     maxes_squeezed = maxes if keepdim else torch.squeeze(maxes, dim)
-    # pyrefly: ignore [no-matching-overload]
+
     result = torch.sum(torch.exp(self - maxes), dim, keepdim)
     return result.log().add(maxes_squeezed)
 
@@ -918,11 +928,12 @@ def logsumexp(
 @out_wrapper()
 def nan_to_num(
     a: TensorLikeType,
-    nan: Optional[NumberType] = 0.0,
-    posinf: Optional[NumberType] = None,
-    neginf: Optional[NumberType] = None,
+    nan: NumberType | None = 0.0,
+    posinf: NumberType | None = None,
+    neginf: NumberType | None = None,
 ) -> TensorLikeType:
-    assert isinstance(a, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
 
     if utils.is_boolean_dtype(a.dtype) or utils.is_integer_dtype(a.dtype):
         return a.clone()
@@ -963,7 +974,8 @@ def neg(a):
 # positive does not use _make_elementwise_unary_reference because it does not support out
 # CompositeImplicitAutograd - don't register decomp
 def positive(a: TensorLikeType) -> TensorLikeType:
-    assert isinstance(a, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
     if a.dtype is torch.bool:
         msg = "positive does not support bool tensors."
         raise RuntimeError(msg)
@@ -972,7 +984,8 @@ def positive(a: TensorLikeType) -> TensorLikeType:
 
 # real does not use _make_elementwise_unary_reference because it does not support out
 def real(a: TensorLikeType) -> TensorLikeType:
-    assert isinstance(a, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
     if utils.is_complex_dtype(a.dtype):
         return prims.real(a)
     return a
@@ -1143,8 +1156,8 @@ def _make_elementwise_binary_reference(
             type_promotion_kind=type_promotion_kind,
         )
         def _ref(
-            a: Union[Tensor, NumberType],
-            b: Union[Tensor, NumberType],
+            a: Tensor | NumberType,
+            b: Tensor | NumberType,
         ) -> Tensor:
             torch._check_value(
                 supports_lhs_python_scalar or not isinstance(a, Number),
@@ -1179,6 +1192,16 @@ def _make_elementwise_binary_reference(
     return inner
 
 
+def _binary_op_dtype(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.dtype:
+    if isinstance(a, TensorLike):
+        return a.dtype
+    if isinstance(b, TensorLike):
+        return b.dtype
+    return utils.type_to_dtype(type(a))
+
+
 # Add has its own implementation because it has an alpha argument
 @register_decomposition(aten.add)
 @out_wrapper()
@@ -1187,10 +1210,10 @@ def _make_elementwise_binary_reference(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def add(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
     *,
-    alpha: Optional[NumberType] = None,
+    alpha: NumberType | None = None,
 ):
     """
     Reference implementation of torch.add
@@ -1199,7 +1222,7 @@ def add(
     a, b = _maybe_broadcast(a, b)
 
     if alpha is not None:
-        dtype = a.dtype if isinstance(a, TensorLike) else b.dtype  # type: ignore[union-attr]
+        dtype = _binary_op_dtype(a, b)
         python_type = utils.dtype_to_type(dtype)
         if python_type is not bool and not utils.is_weakly_lesser_type(
             type(alpha), python_type
@@ -1263,9 +1286,7 @@ def bitwise_xor(a: TensorLikeType, b: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     supports_lhs_python_scalar=False,
 )
-def copysign(
-    a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberType]
-):
+def copysign(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
     if isinstance(b, Number) and isinstance(a, Tensor):
         # pyrefly: ignore [bad-argument-type]
         b = scalar_tensor(b, dtype=a.dtype, device=a.device)
@@ -1282,10 +1303,10 @@ def copysign(
 @register_decomposition(aten.div)
 @out_wrapper()
 def div(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
     *,
-    rounding_mode: Optional[str] = None,
+    rounding_mode: str | None = None,
 ):
     """
     Reference implementation of torch.div
@@ -1313,22 +1334,25 @@ def eq(a: TensorLikeType, b: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.BOOL_TO_LONG,
 )
 def pow(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
 ) -> TensorLikeType:
-    assert isinstance(a, TensorLikeType) or isinstance(b, TensorLikeType)
+    from torch.fx.experimental.symbolic_shapes import statically_known_true
+
+    if not (isinstance(a, TensorLikeType) or isinstance(b, TensorLikeType)):
+        raise AssertionError("at least one of a or b must be TensorLikeType")
 
     if isinstance(b, Number):
-        if b == 1.0:
+        if statically_known_true(b == 1.0):
             return a.clone()  # type: ignore[return-value,union-attr]
-        elif b == 2.0:
+        elif statically_known_true(b == 2.0):
             return a * a  # type: ignore[return-value]
-        elif b == 0.5:
+        elif statically_known_true(b == 0.5):
             return torch.sqrt(a)  # type: ignore[arg-type]
     elif isinstance(a, Number):
-        if a == 1.0:
+        if statically_known_true(a == 1.0):
             return torch.fill(b, True)
-        if a == 2.0 and (
+        if statically_known_true(a == 2.0) and (
             utils.is_float_dtype(b.dtype) or utils.is_complex_dtype(b.dtype)
         ):
             return torch.exp2(b)
@@ -1340,8 +1364,8 @@ def pow(
 # CompositeImplicitAutograd - don't register decomp
 @out_wrapper()
 def float_power(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
 ) -> Tensor:
     if isinstance(a, Number) and isinstance(b, Number):
         raise ValueError(
@@ -1350,7 +1374,8 @@ def float_power(
 
     # Handles type promotion
     dtype = utils.get_higher_dtype(a, b)
-    assert dtype is not None
+    if dtype is None:
+        raise AssertionError("dtype should not be None after get_higher_dtype")
     if utils.is_complex_dtype(dtype):
         dtype = torch.complex128
     else:
@@ -1364,7 +1389,7 @@ def float_power(
     b = _maybe_convert_to_dtype(b, dtype)
 
     a, b = _maybe_broadcast(a, b)
-    # pyrefly: ignore [bad-return]
+
     return pow(a, b)
 
 
@@ -1401,9 +1426,7 @@ def float_power(
     supports_two_python_scalars=True,
     should_register_decomposition=False,
 )
-def floor_divide(
-    a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberType]
-):
+def floor_divide(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
     # Wrap scalars because some references only accept tensor arguments.
     if isinstance(a, Number) and isinstance(b, Number):
         # pyrefly: ignore [bad-argument-type]
@@ -1423,7 +1446,8 @@ def floor_divide(
         else:
             b = prims.device_put(b, device=a.device)
 
-    assert isinstance(a, Tensor) and isinstance(b, Tensor)
+    if not (isinstance(a, Tensor) and isinstance(b, Tensor)):
+        raise AssertionError("a and b must both be Tensors at this point")
     dtype = a.dtype
     if utils.is_float_dtype(dtype):
         return _floor_divide_float(a, b)
@@ -1809,8 +1833,8 @@ def remainder(a: TensorLikeType, b: TensorLikeType) -> TensorLikeType:
 @register_decomposition(aten.rsub)
 @out_wrapper()
 def rsub(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
     alpha: NumberType = 1,
 ):
     if isinstance(a, Number):
@@ -1829,8 +1853,8 @@ def rsub(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def sub(
-    a: Union[TensorLikeType, NumberType],
-    b: Union[TensorLikeType, NumberType],
+    a: TensorLikeType | NumberType,
+    b: TensorLikeType | NumberType,
     *,
     alpha: NumberType = 1,
 ):
@@ -1850,7 +1874,7 @@ def sub(
         )
 
     if alpha != 1:
-        dtype = a.dtype if isinstance(a, TensorLike) else b.dtype  # type: ignore[union-attr]
+        dtype = _binary_op_dtype(a, b)
         python_type = utils.dtype_to_type(dtype)
         if not utils.is_weakly_lesser_type(type(alpha), python_type):
             msg = f"alpha argument of type {type(alpha)} cannot be safely cast to type {python_type}!"
@@ -1883,7 +1907,7 @@ def true_divide(a: TensorLikeType, b: TensorLikeType) -> TensorLikeType:
     type_promoting_args=("a", "b"),
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
-def xlogy(a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberType]):
+def xlogy(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
     torch._check(
         isinstance(a, TensorLike) or isinstance(b, TensorLike),
         lambda: 'Expected either argument a or b to be a Tensor"',
@@ -1898,8 +1922,10 @@ def xlogy(a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberT
         b = scalar_tensor(b, dtype=a.dtype, device=a.device)
 
     # mypy: expected "Tensor"
-    assert isinstance(a, TensorLike)
-    assert isinstance(b, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
+    if not isinstance(b, TensorLike):
+        raise AssertionError(f"b must be TensorLike, got {type(b)}")
     rhs = torch.where(torch.eq(a, 0), 0, torch.mul(a, torch.log(b)))
     return torch.where(torch.isnan(b), float("nan"), rhs)
 
@@ -1909,9 +1935,7 @@ def xlogy(a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberT
     aten_op=None,  # CompositeImplicitAutograd
     supports_two_python_scalars=True,
 )
-def trunc_divide(
-    a: Union[TensorLikeType, NumberType], b: Union[TensorLikeType, NumberType]
-):
+def trunc_divide(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
     dtype = utils.get_dtype(a)
     if utils.is_integer_dtype(dtype):
         return prims.div(a, b)
@@ -1986,13 +2010,14 @@ def addcmul(
 )
 def clamp(
     a: TensorLikeType,
-    min: Optional[TensorOrNumberLikeType] = None,
-    max: Optional[TensorOrNumberLikeType] = None,
+    min: TensorOrNumberLikeType | None = None,
+    max: TensorOrNumberLikeType | None = None,
 ) -> TensorLikeType:
     # NOTE: grad behavior with implementation `where` is not consistent on `nan`
     if min is None and max is None:
         msg = "clamp called but both min and max are none!"
         raise ValueError(msg)
+
     if min is not None:
         a_isnan = torch.isnan(a)
         condition = torch.bitwise_or(torch.ge(a, min), a_isnan)  # type: ignore[arg-type]
@@ -2014,7 +2039,7 @@ def clamp(
 @out_wrapper()
 def clamp_min(
     self: TensorLikeType,
-    min: Optional[TensorOrNumberLikeType] = None,
+    min: TensorOrNumberLikeType | None = None,
 ) -> TensorLikeType:
     return torch.clamp(self, min=min)  # type: ignore[arg-type]
 
@@ -2023,7 +2048,7 @@ def clamp_min(
 @out_wrapper()
 def clamp_max(
     self: TensorLikeType,
-    max: Optional[TensorOrNumberLikeType] = None,
+    max: TensorOrNumberLikeType | None = None,
 ) -> TensorLikeType:
     return torch.clamp(self, max=max)  # type: ignore[arg-type]
 
@@ -2034,7 +2059,11 @@ def clamp_max(
 
 
 # https://pytorch.org/docs/stable/generated/torch.where.html
-# TODO: implement where.default
+@register_decomposition(aten.where.default)
+def _where_default(pred: Tensor) -> tuple[Tensor, ...]:
+    return torch.nonzero(pred, as_tuple=True)
+
+
 @register_decomposition(aten.where.self)
 @register_decomposition(aten.where.ScalarSelf)
 @register_decomposition(aten.where.ScalarOther)
@@ -2047,8 +2076,8 @@ def clamp_max(
 )
 def where(
     pred: Tensor,
-    a: Optional[TensorOrNumberLikeType] = None,
-    b: Optional[TensorOrNumberLikeType] = None,
+    a: TensorOrNumberLikeType | None = None,
+    b: TensorOrNumberLikeType | None = None,
 ):
     """ """
 
@@ -2100,12 +2129,12 @@ def item(a: TensorLikeType) -> NumberType:
 # fast path when `to` returns an alias to input. This mimics the same function in aten
 def _to_will_alias(
     a: TensorLikeType,
-    device: Optional[DeviceLikeType] = None,
-    dtype: Optional[torch.dtype] = None,
-    copy: Optional[bool] = None,
-    layout: Optional[torch.layout] = None,
-    memory_format: Optional[torch.memory_format] = None,
-    pin_memory: Optional[bool] = False,
+    device: DeviceLikeType | None = None,
+    dtype: torch.dtype | None = None,
+    copy: bool | None = None,
+    layout: torch.layout | None = None,
+    memory_format: torch.memory_format | None = None,
+    pin_memory: bool | None = False,
     non_blocking: bool = False,  # not using non_blocking
 ) -> bool:
     return (
@@ -2134,7 +2163,7 @@ def _to_device(
     dtype: torch.dtype,
     non_blocking: bool = False,
     copy: bool = False,
-    memory_format: Optional[torch.memory_format] = None,
+    memory_format: torch.memory_format | None = None,
 ) -> dict[str, Any]:
     kwargs = {
         "device": device,
@@ -2152,7 +2181,7 @@ def _to_device_str(
     dtype: torch.dtype,
     non_blocking: bool = False,
     copy: bool = False,
-    memory_format: Optional[torch.memory_format] = None,
+    memory_format: torch.memory_format | None = None,
 ) -> dict[str, Any]:
     kwargs = {
         "device": torch.device(device),
@@ -2169,7 +2198,7 @@ def _to_dtype(
     dtype: torch.dtype,
     non_blocking: bool = False,
     copy: bool = False,
-    memory_format: Optional[torch.memory_format] = None,
+    memory_format: torch.memory_format | None = None,
 ) -> dict[str, Any]:
     kwargs = {
         "dtype": dtype,
@@ -2185,7 +2214,7 @@ def _to_other(
     other: Tensor,
     non_blocking: bool = False,
     copy: bool = False,
-    memory_format: Optional[torch.memory_format] = None,
+    memory_format: torch.memory_format | None = None,
 ) -> dict[str, Any]:
     device = other.device
     dtype = other.dtype
@@ -2235,7 +2264,8 @@ def to(a: TensorLikeType, *args, **kwargs) -> TensorLikeType:
 
     # TODO: is_pinned is not currently supported in refs or fake_tensor
     # https://github.com/pytorch/pytorch/issues/84925
-    assert "pin_memory" not in kwargs
+    if "pin_memory" in kwargs:
+        raise AssertionError("pin_memory is not supported in refs")
     _canonicalize_to_arguments(a, kwargs)
 
     if _to_will_alias(a, **kwargs):
@@ -2273,21 +2303,23 @@ def _reduction(
     *,
     has_identity: bool = True,
     accepts_dim_tuple: bool = True,  # to handle min/argmin that accept single dim only
-    dims: Optional[DimsType] = None,
+    dims: DimsType | None = None,
     keepdims: bool = False,
-    dtype: Optional[torch.dtype] = None,  # should be specified for ops that support it
-    out: Optional[Tensor] = None,
+    dtype: torch.dtype | None = None,  # should be specified for ops that support it
+    out: Tensor | None = None,
     output_dtype_kind: REDUCTION_OUTPUT_TYPE_KIND,
 ) -> TensorLikeType:  # it is usually SAME, but I want
     # ref writers to actually think about what to put here
-    assert isinstance(a, TensorLike)
+    if not isinstance(a, TensorLike):
+        raise AssertionError(f"a must be TensorLike, got {type(a)}")
     if a.ndim > 64:
         raise RuntimeError(
             f"Received a tensor with {a.ndim} dimensions, but only tensors with up to 64 dims are supported!"
         )
 
     if out is not None:
-        assert isinstance(out, TensorLike)
+        if not isinstance(out, TensorLike):
+            raise AssertionError(f"out must be TensorLike, got {type(out)}")
         if dtype is not None:
             # TODO - this is true for eager mode currently, but it's wrong behavior for complex norms
             if dtype != out.dtype:
@@ -2295,7 +2327,8 @@ def _reduction(
                     "dtype argument and out dtype must match in reduction"
                 )
     if not accepts_dim_tuple:
-        assert dims is None or isinstance(dims, Dim)
+        if not (dims is None or isinstance(dims, Dim)):
+            raise AssertionError(f"dims must be None or Dim, got {type(dims)}")
     if isinstance(dims, Dim):
         dims = (dims,)  # type: ignore[assignment]
     dims = utils.reduction_dims(a.shape, dims)
@@ -2319,7 +2352,8 @@ def _reduction(
         result = prims.broadcast_in_dim(result, output_shape, broadcast_dims)
 
     if out is not None:
-        assert result_dtype is not None
+        if result_dtype is None:
+            raise AssertionError("result_dtype should not be None when out is provided")
         if dtype is not None and result_dtype != out.dtype:
             raise RuntimeError(
                 "Expected the dtype of reduction result and out to match"
@@ -2367,7 +2401,7 @@ def _make_copy_from_view(fn, return_none_on_out_variant=False):
 @out_wrapper()
 def all(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     keepdim: bool = False,
 ) -> TensorLikeType:
     result = torch.logical_not(torch.any(torch.logical_not(a), dim, keepdim=keepdim))
@@ -2382,7 +2416,7 @@ def all(
 @out_wrapper()
 def any(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     keepdim: bool = False,
 ) -> TensorLikeType:
     a_ = _maybe_convert_to_dtype(a, torch.bool)
@@ -2401,11 +2435,11 @@ def any(
 @register_decomposition([aten.sum.dim_IntList, aten.sum.IntList_out])
 def sum(
     a: TensorLikeType,
-    dim: Union[Optional[int], Optional[list[int]]] = None,
+    dim: int | None | list[int] = None,
     keepdim: bool = False,
     *,
-    dtype: Optional[torch.dtype] = None,
-    out: Optional[Tensor] = None,
+    dtype: torch.dtype | None = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     if dtype is None:
         if out is not None:
@@ -2453,11 +2487,11 @@ def sum_to_size(
 @register_decomposition(aten.prod)
 def prod(
     a: TensorLikeType,
-    dim: Union[Optional[int], Optional[list[int]]] = None,
+    dim: int | None | list[int] = None,
     keepdim: bool = False,
     *,
     dtype=None,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     if dtype is None:
         if out is not None:
@@ -2483,10 +2517,10 @@ def prod(
 @register_decomposition(aten.amin)
 def amin(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     keepdim: bool = False,
     *,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     # reduces over all dimensions if dim=() is passed
     if dim == () or dim == []:
@@ -2507,10 +2541,10 @@ def amin(
 @register_decomposition(aten.amax)
 def amax(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     keepdim: bool = False,
     *,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     # reduces over all dimensions if dim=() is passed
     if dim == () or dim == []:
@@ -2542,11 +2576,11 @@ def _dim_var_dispatch(dim=None, unbiased=None):
 @out_wrapper()
 def var(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
-    unbiased: Optional[bool] = None,
+    dim: DimsType | None = None,
+    unbiased: bool | None = None,
     keepdim: bool = False,
     *,
-    correction: Optional[NumberType] = None,
+    correction: NumberType | None = None,
 ) -> TensorLikeType:
     dim, unbiased = _dim_var_dispatch(dim, unbiased)
     correction = utils.set_correction(unbiased, correction)
@@ -2571,11 +2605,11 @@ def var(
 @out_wrapper()
 def std(
     a: TensorLikeType,
-    dim: Union[Optional[int], Optional[list[int]]] = None,
-    unbiased: Optional[bool] = None,
+    dim: int | None | list[int] = None,
+    unbiased: bool | None = None,
     keepdim: bool = False,
     *,
-    correction: Optional[NumberType] = None,
+    correction: NumberType | None = None,
 ) -> TensorLikeType:
     dim, unbiased = _dim_var_dispatch(dim, unbiased)
     correction = utils.set_correction(unbiased, correction)
@@ -2586,14 +2620,15 @@ def std(
     a = _maybe_convert_to_dtype(a, opmath_dtype)
     a_var = torch.var(a, dim, correction=correction, keepdim=keepdim)
     a_std = torch.sqrt(a_var)
-    assert dtype is not None
+    if dtype is None:
+        raise AssertionError("dtype should not be None after reduction_dtypes")
     return _maybe_convert_to_dtype(a_std, dtype)
 
 
 @register_decomposition(aten.mean)
 def mean(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     keepdim: bool = False,
     *,
     dtype=None,
@@ -2630,7 +2665,8 @@ def mean(
     result_dtype = a.dtype if dtype is None else dtype
     result = _maybe_convert_to_dtype(result, result_dtype)  # type: ignore[method-assign]
     if out is not None:
-        assert isinstance(out, TensorLike)
+        if not isinstance(out, TensorLike):
+            raise AssertionError(f"out must be TensorLike, got {type(out)}")
         out = _maybe_resize_out(out, result.shape)
         return _safe_copy_out(copy_from=result, copy_to=out)  # type: ignore[arg-type]
     return result
@@ -2640,11 +2676,11 @@ def mean(
 @out_wrapper("out0", "out1")
 def std_mean(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
+    dim: DimsType | None = None,
     *,
-    unbiased: Optional[bool] = None,
+    unbiased: bool | None = None,
     keepdim: bool = False,
-    correction: Optional[NumberType] = None,
+    correction: NumberType | None = None,
 ):
     dim, unbiased = _dim_var_dispatch(dim, unbiased)
     correction = utils.set_correction(unbiased, correction)
@@ -2655,7 +2691,8 @@ def std_mean(
     a = _maybe_convert_to_dtype(a, opmath_dtype)
     a_var, a_mean = torch.var_mean(a, dim, correction=correction, keepdim=keepdim)
     a_std = torch.sqrt(a_var)
-    assert dtype is not None
+    if dtype is None:
+        raise AssertionError("dtype should not be None after reduction_dtypes")
     return (
         _maybe_convert_to_dtype(a_std, dtype),
         _maybe_convert_to_dtype(a_mean, original_dtype),
@@ -2666,11 +2703,11 @@ def std_mean(
 @out_wrapper("out0", "out1")
 def var_mean(
     a: TensorLikeType,
-    dim: Optional[DimsType] = None,
-    unbiased: Optional[bool] = None,
+    dim: DimsType | None = None,
+    unbiased: bool | None = None,
     keepdim: bool = False,
     *,
-    correction: Optional[NumberType] = None,
+    correction: NumberType | None = None,
 ):
     dim, unbiased = _dim_var_dispatch(dim, unbiased)
     v = var(a, dim, unbiased, keepdim, correction=correction)
@@ -2717,7 +2754,7 @@ def addr(
         )
         torch._check(
             is_weakly_lesser_type(type(alpha), int),
-            lambda: f"expected bool/int alpha but got {type(beta)}",
+            lambda: f"expected bool/int alpha but got {type(alpha)}",
         )
         if not beta:
             return torch.outer(vec1, vec2) if alpha else torch.full_like(self, False)
@@ -2744,13 +2781,14 @@ def addr(
 
 # CompositeImplicitAutograd - don't register decomp
 def atleast_1d(
-    arg: Union[TensorLikeType, Sequence[TensorLikeType]], *args: TensorLikeType
-) -> Union[TensorLikeType, tuple[TensorLikeType, ...]]:
+    arg: TensorLikeType | Sequence[TensorLikeType], *args: TensorLikeType
+) -> TensorLikeType | tuple[TensorLikeType, ...]:
     """Reference implementation of :func:`torch.atleast_1d`."""
     if not args and isinstance(arg, collections.abc.Sequence):
         args_ = arg
     else:
-        assert not isinstance(arg, collections.abc.Sequence)
+        if isinstance(arg, collections.abc.Sequence):
+            raise AssertionError("arg should not be a Sequence when args is provided")
         args_ = (arg,) + args
     res = tuple(a if a.ndim >= 1 else unsqueeze(a, 0) for a in args_)
     return res if len(res) > 1 else res[0]
@@ -2762,19 +2800,21 @@ def _unsqueeze_atleast(
     at_least_fn: Callable, dim: int, arg: TensorLikeType
 ) -> TensorLikeType:
     arg_ = at_least_fn(arg)
-    assert isinstance(arg_, TensorLike)
+    if not isinstance(arg_, TensorLike):
+        raise AssertionError(f"at_least_fn must return TensorLike, got {type(arg_)}")
     return unsqueeze(arg_, dim)
 
 
 # CompositeImplicitAutograd - don't register decomp
 def atleast_2d(
-    arg: Union[TensorLikeType, Sequence[TensorLikeType]], *args: TensorLikeType
-) -> Union[TensorLikeType, tuple[TensorLikeType, ...]]:
+    arg: TensorLikeType | Sequence[TensorLikeType], *args: TensorLikeType
+) -> TensorLikeType | tuple[TensorLikeType, ...]:
     """Reference implementation of :func:`torch.atleast_2d`."""
     if not args and isinstance(arg, collections.abc.Sequence):
         args_ = arg
     else:
-        assert not isinstance(arg, collections.abc.Sequence)
+        if isinstance(arg, collections.abc.Sequence):
+            raise AssertionError("arg should not be a Sequence when args is provided")
         args_ = (arg,) + args
     unsqueeze_atleast_1d = partial(_unsqueeze_atleast, atleast_1d, 0)
     res = tuple(a if a.ndim >= 2 else unsqueeze_atleast_1d(a) for a in args_)
@@ -2783,13 +2823,14 @@ def atleast_2d(
 
 # CompositeImplicitAutograd - don't register decomp
 def atleast_3d(
-    arg: Union[TensorLikeType, Sequence[TensorLikeType]], *args: TensorLikeType
-) -> Union[TensorLikeType, tuple[TensorLikeType, ...]]:
+    arg: TensorLikeType | Sequence[TensorLikeType], *args: TensorLikeType
+) -> TensorLikeType | tuple[TensorLikeType, ...]:
     """Reference implementation of :func:`torch.atleast_3d`."""
     if not args and isinstance(arg, collections.abc.Sequence):
         args_ = arg
     else:
-        assert not isinstance(arg, collections.abc.Sequence)
+        if isinstance(arg, collections.abc.Sequence):
+            raise AssertionError("arg should not be a Sequence when args is provided")
         args_ = (arg,) + args
     unsqueeze_atleast_2d = partial(_unsqueeze_atleast, atleast_2d, -1)
     res = tuple(a if a.ndim >= 3 else unsqueeze_atleast_2d(a) for a in args_)
@@ -2800,7 +2841,7 @@ def as_strided(
     a: TensorLikeType,
     size: ShapeType,
     stride: StrideType,
-    storage_offset: Optional[int] = None,
+    storage_offset: int | None = None,
 ) -> TensorLikeType:
     storage_offset_int = (
         storage_offset if storage_offset is not None else a.storage_offset()
@@ -2815,7 +2856,7 @@ def as_strided_scatter(
     src: TensorLikeType,
     size: ShapeType,
     stride: StrideType,
-    storage_offset: Optional[int] = None,
+    storage_offset: int | None = None,
 ) -> TensorLikeType:
     storage_offset_int = 0 if storage_offset is None else storage_offset
     return prims.as_strided_scatter(input, src, size, stride, storage_offset_int)
@@ -2856,7 +2897,8 @@ def cat(tensors: TensorSequenceType, dim: int = 0) -> TensorLikeType:
             if format is not None and format != f:
                 return torch.contiguous_format
             format = f
-        assert format is not None
+        if format is None:
+            raise AssertionError("format should not be None if len(inputs) > 0")
         return format
 
     if len(tensors) == 0:
@@ -2864,7 +2906,8 @@ def cat(tensors: TensorSequenceType, dim: int = 0) -> TensorLikeType:
         raise ValueError(msg)
 
     for tensor in tensors:
-        assert isinstance(tensor, TensorLike)
+        if not isinstance(tensor, TensorLike):
+            raise AssertionError(f"tensor must be TensorLike, got {type(tensor)}")
 
     utils.check_same_device(*tensors, allow_cpu_scalar_tensors=False)
 
@@ -2910,7 +2953,10 @@ def cat(tensors: TensorSequenceType, dim: int = 0) -> TensorLikeType:
     filtered = []
     for tensor_idx, tensor in enumerate(tensors):
         if len(shape) != len(tensor.shape):
-            assert tensor.ndim == 1  # we've already checked this above
+            if tensor.ndim != 1:
+                raise AssertionError(
+                    f"tensor.ndim should be 1 at this point, got {tensor.ndim}"
+                )
             # Don't suggest the legacy behavior in the error message
             torch._check(
                 # NB: it is not enough to simply assert that tensor.shape[0] == 0;
@@ -3027,8 +3073,6 @@ def constant_pad_nd(
     if builtins.all(p < 0 for p in pad):
         return c_input.clone()
 
-    new_shape = list(input_sizes[:l_diff])
-
     for i in range(l_pad):
         pad_idx = len(pad) - ((i + 1) * 2)
         new_dim = input_sizes[l_diff + i] + pad[pad_idx] + pad[pad_idx + 1]
@@ -3038,34 +3082,39 @@ def constant_pad_nd(
             f"{pad[pad_idx]} and {pad[pad_idx + 1]} resulted in a negative output size, "
             f"which is invalid. Check dimension {l_diff + i} of your input.",
         )
-        new_shape.append(new_dim)
-
-    memory_format = utils.suggest_memory_format(input)
-    output = torch.empty(
-        new_shape,
-        dtype=input.dtype,
-        device=input.device,
-        requires_grad=input.requires_grad,
-        memory_format=memory_format,
-    )
 
     if value == 0 and input.dtype == torch.bool:
         value = False
-    # torch.fill isn't typed to allow complex values
-    output = torch.fill(output, value)  # type: ignore[arg-type]
 
-    c_output = output
+    result = c_input
     for i in range(l_diff, l_inp):
         pad_idx = 2 * (l_inp - i - 1)
-        if pad[pad_idx] >= 0:
-            c_output = c_output.narrow(
-                i, pad[pad_idx], c_output.shape[i] - pad[pad_idx]
+        left = max(pad[pad_idx], 0)
+        right = max(pad[pad_idx + 1], 0)
+        if left == 0 and right == 0:
+            continue
+        parts = []
+        if left > 0:
+            left_shape = list(result.shape)
+            left_shape[i] = left
+            # torch.full isn't typed to allow complex values
+            parts.append(
+                torch.full(left_shape, value, dtype=input.dtype, device=input.device)  # type: ignore[arg-type]
             )
-        if pad[pad_idx + 1] >= 0:
-            c_output = c_output.narrow(i, 0, c_output.shape[i] - pad[pad_idx + 1])
+        parts.append(result)
+        if right > 0:
+            right_shape = list(result.shape)
+            right_shape[i] = right
+            # torch.full isn't typed to allow complex values
+            parts.append(
+                torch.full(right_shape, value, dtype=input.dtype, device=input.device)  # type: ignore[arg-type]
+            )
+        result = torch.cat(parts, dim=i)
 
-    prims.copy_to(c_output, c_input)
-    return output
+    if result is c_input:
+        result = result.clone()
+
+    return result.contiguous(memory_format=utils.suggest_memory_format(input))
 
 
 def contiguous(
@@ -3092,7 +3141,12 @@ def dstack(tensors: TensorSequenceType) -> TensorLikeType:
 
 @register_decomposition(aten.expand)
 def expand(a: Tensor, *shape, implicit: bool = False) -> Tensor:
-    from torch.fx.experimental.symbolic_shapes import guard_or_false, size_hint, sym_or
+    from torch.fx.experimental.symbolic_shapes import (
+        guard_or_false,
+        guarding_hint_or_throw,
+        has_guarding_hint,
+        sym_or,
+    )
 
     backed_so = torch.fx.experimental._config.backed_size_oblivious
 
@@ -3128,15 +3182,19 @@ def expand(a: Tensor, *shape, implicit: bool = False) -> Tensor:
             shape_[offset_idx] = x
         else:
             # When backed size oblivious is used, we specialize for broadcasting
-            # if its the only way to compile the example input.
+            # if it's the only way to compile the example input.
             # i.e: x:1, requested_length:1 ==>
             #           assert x==requested_length, no specialization on ==1 or !=1.
             #            The non-broadcast path is picked
             #      x:1, requested_length:4 ==>
             #           specialize(x) to be 1.
-            if backed_so:
-                x_hint = size_hint(x, allow_none=True)
-                requested_hint = size_hint(requested_length, allow_none=True)
+            if (
+                backed_so
+                and has_guarding_hint(x)
+                and has_guarding_hint(requested_length)
+            ):
+                x_hint = guarding_hint_or_throw(x)
+                requested_hint = guarding_hint_or_throw(requested_length)
                 if x_hint == 1 and requested_hint != 1:
                     torch._check(x == 1)
 
@@ -3210,6 +3268,8 @@ def flip(a: TensorLikeType, dims: DimsSequenceType) -> TensorLikeType:
         raise ValueError("dims has to be a sequence of ints")
     dims = utils.canonicalize_dims(a.ndim, dims)  # type: ignore[assignment]
     utils.validate_no_repeating_dims(dims)
+    if a.ndim == 0:
+        return torch.clone(a)
     return prims.rev(a, dims)
 
 
@@ -3231,7 +3291,7 @@ def flipud(a: TensorLikeType) -> TensorLikeType:
 
 # CompositeImplicitAutograd - don't register decomp
 def narrow(
-    a: TensorLikeType, dim: int, start: Union[int, TensorLikeType], length: int
+    a: TensorLikeType, dim: int, start: int | TensorLikeType, length: int
 ) -> TensorLikeType:
     # Supports Tensor overload that was added for XLA:
     # https://github.com/pytorch/pytorch/issues/31558
@@ -3285,7 +3345,8 @@ def _normalize(
     norm_dims = utils.canonicalize_dims(a.ndim, norm_dims)
     computation_dtype = utils.get_computation_dtype(a.dtype)
     a_acc = _maybe_convert_to_dtype(a, computation_dtype)
-    assert isinstance(a_acc, TensorLike)  # to avoid mypy error for var_mean
+    if not isinstance(a_acc, TensorLike):
+        raise AssertionError(f"a_acc must be TensorLike, got {type(a_acc)}")
     biased_var, mean = torch.var_mean(
         a_acc, dim=norm_dims, unbiased=False, keepdim=True
     )
@@ -3304,8 +3365,8 @@ def _unsqueeze_multiple(x: TensorLikeType, dimensions: list[int]) -> TensorLikeT
 @register_decomposition(aten.native_group_norm.default)
 def native_group_norm(
     input: Tensor,
-    weight: Optional[Tensor],
-    bias: Optional[Tensor],
+    weight: Tensor | None,
+    bias: Tensor | None,
     batch_size: int,
     num_channels: int,
     flattened_inner_size: int,
@@ -3373,13 +3434,73 @@ def native_group_norm(
     return (out, mean, rstd)
 
 
+_SCALAR_TYPE_NAME_OVERRIDES = {
+    "uint8": "Byte",
+    "int8": "Char",
+    "int16": "Short",
+    "int32": "Int",
+    "int64": "Long",
+    "float16": "Half",
+    "float32": "Float",
+    "float64": "Double",
+    "complex32": "ComplexHalf",
+    "complex64": "ComplexFloat",
+    "complex128": "ComplexDouble",
+    "bool": "Bool",
+    "qint8": "QInt8",
+    "quint8": "QUInt8",
+    "qint32": "QInt32",
+    "bfloat16": "BFloat16",
+    "quint4x2": "QUInt4x2",
+    "quint2x4": "QUInt2x4",
+    "bcomplex32": "BComplex32",
+}
+
+
+def _scalar_type_name(dtype: torch.dtype) -> str:
+    dtype_name = str(dtype).removeprefix("torch.")
+    if dtype_name in _SCALAR_TYPE_NAME_OVERRIDES:
+        return _SCALAR_TYPE_NAME_OVERRIDES[dtype_name]
+    if dtype_name.startswith("uint"):
+        return "UInt" + dtype_name.removeprefix("uint")
+    return dtype_name[:1].upper() + dtype_name[1:]
+
+
+def _check_native_layer_norm_cuda_param_dtype(
+    input: Tensor,
+    normalized_ndim: int,
+    weight: Tensor | None,
+    bias: Tensor | None,
+) -> None:
+    if input.device.type != "cuda":
+        return
+
+    mismatched_dtype = None
+    if weight is not None and weight.dtype != input.dtype:
+        mismatched_dtype = weight.dtype
+    elif bias is not None and bias.dtype != input.dtype:
+        mismatched_dtype = bias.dtype
+
+    if mismatched_dtype is None:
+        return
+
+    axis = input.ndim - normalized_ndim
+    num_rows = math.prod(input.shape[:axis])
+    expected_dtype = _scalar_type_name(input.dtype)
+    found_dtype = _scalar_type_name(mismatched_dtype)
+    torch._check(
+        num_rows == 0,
+        lambda: f"expected scalar type {expected_dtype} but found {found_dtype}",
+    )
+
+
 @register_decomposition(aten.native_layer_norm)
 @out_wrapper("out0", "out1", "out2")
 def native_layer_norm(
     input: Tensor,
     normalized_shape: ShapeType,
-    weight: Optional[Tensor],
-    bias: Optional[Tensor],
+    weight: Tensor | None,
+    bias: Tensor | None,
     eps: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     from torch.fx.experimental.symbolic_shapes import sym_eq
@@ -3416,7 +3537,6 @@ def native_layer_norm(
         input.ndim >= normalized_ndim
         and sym_eq(
             input.shape[(input.ndim - normalized_ndim) :],
-            # pyrefly: ignore [bad-argument-type]
             tuple(normalized_shape),
         ),
         lambda: "Given normalized_shape="
@@ -3426,6 +3546,11 @@ def native_layer_norm(
         + ", but got input of size "
         + str(input.shape),
     )
+    torch._check(
+        not input.is_complex(),
+        lambda: "native_layer_norm does not support complex inputs",
+    )
+    _check_native_layer_norm_cuda_param_dtype(input, normalized_ndim, weight, bias)
 
     input = contiguous(input)
     if weight is not None:
@@ -3511,15 +3636,15 @@ def renorm(
 def stft(
     input: Tensor,
     n_fft: int,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: Optional[Tensor] = None,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: Tensor | None = None,
     center: bool = True,
     pad_mode: str = "reflect",
     normalized: bool = False,
-    onesided: Optional[bool] = None,
-    return_complex: Optional[bool] = None,
-    align_to_window: Optional[bool] = None,
+    onesided: bool | None = None,
+    return_complex: bool | None = None,
+    align_to_window: bool | None = None,
 ) -> Tensor:
     torch._check(
         window is None or window.device == input.device,
@@ -3628,13 +3753,13 @@ def stft(
 def istft(
     input: Tensor,
     n_fft: int,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: Optional[Tensor] = None,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: Tensor | None = None,
     center: bool = True,
     normalized: bool = False,
-    onesided: Optional[bool] = None,
-    length: Optional[int] = None,
+    onesided: bool | None = None,
+    length: int | None = None,
     return_complex=False,
 ) -> Tensor:
     torch._check(
@@ -3726,7 +3851,10 @@ def istft(
             input = input.narrow(dim=-1, start=0, length=n_fft // 2 + 1)
         input = torch.fft.irfft(input, dim=-1, norm=norm)
 
-    assert input.size(2) == n_fft
+    if input.size(2) != n_fft:
+        raise AssertionError(
+            f"Expected input.size(2) == n_fft, got {input.size(2)} != {n_fft}"
+        )
 
     y_tmp = input * window_.view([1, 1, n_fft])
     y = aten.unfold_backward(
@@ -3744,8 +3872,14 @@ def istft(
         step=hop_length_,
     )
 
-    assert expected_output_signal_len == y.size(1)
-    assert expected_output_signal_len == window_envelop.size(1)
+    if expected_output_signal_len != y.size(1):
+        raise AssertionError(
+            f"expected_output_signal_len ({expected_output_signal_len}) != y.size(1) ({y.size(1)})"
+        )
+    if expected_output_signal_len != window_envelop.size(1):
+        raise AssertionError(
+            f"expected_output_signal_len ({expected_output_signal_len}) != window_envelop.size(1) ({window_envelop.size(1)})"
+        )
 
     start = n_fft // 2 if center else 0
     if length is not None:
@@ -3755,21 +3889,47 @@ def istft(
     else:
         end = expected_output_signal_len
 
-    length = max(0, end - start)
-    y = y.narrow(dim=1, start=start, length=length)
-    window_envelop = window_envelop.narrow(dim=1, start=start, length=length)
+    # Clamp end to the valid signal range before slicing so that downstream
+    # meta / fake-tensor execution never sees an out-of-bounds access.
+    # The eager C++ path relies on slice's implicit clamping, but the
+    # compile path may convert slice to narrow which does not clamp.
+    # Use sym_min (not the builtin min) so the clamp stays symbolic under
+    # dynamic shapes: builtin min would evaluate ``end < expected_output_signal_len``
+    # to a concrete bool, installing a guard for backed symints (forcing a
+    # recompile when the relationship flips) or raising
+    # GuardOnDataDependentSymNode for unbacked symints.
+    clamped_end = sym_min(end, expected_output_signal_len)
+
+    y = aten.slice.Tensor(y, 1, start, clamped_end, 1)
+    window_envelop = aten.slice.Tensor(window_envelop, 1, start, clamped_end, 1)
 
     y = y / window_envelop
     if original_ndim == 2:
         y = y.squeeze(0)
 
-    if end > expected_output_signal_len:
+    # Pad the tail symbolically so dynamic shapes don't force a guard on the
+    # ``end`` vs ``expected_output_signal_len`` relationship. sym_max keeps the
+    # pad >= 0, so a zero pad is a no-op when the signal already covers the
+    # requested length. The warning needs a concrete decision, so it is gated on
+    # statically_known_true: it fires for the common concrete-int case but
+    # installs no guard when the relationship isn't statically known.
+    from torch.fx.experimental.symbolic_shapes import statically_known_true
+
+    if statically_known_true(end > expected_output_signal_len):
         warnings.warn(
             "The length of signal is shorter than the length parameter. Result is being "
             + "padded with zeros in the tail. Please check your center and hop_length settings",
             stacklevel=2,
         )
-        y = aten.constant_pad_nd(y, (0, end - expected_output_signal_len), 0)
+    # Only emit the pad when the signal may be shorter than the requested
+    # length. Skipping it in the statically-known no-pad case avoids turning the
+    # view returned by eager (e.g. the squeeze) into a copy, which keeps
+    # _refs.istft view-consistent with the aten op. When the relationship is not
+    # statically known (dynamic shapes), pad symbolically with sym_max so a zero
+    # pad is a no-op and no specializing guard is installed.
+    if not statically_known_true(end <= expected_output_signal_len):
+        pad = sym_max(end - expected_output_signal_len, 0)
+        y = aten.constant_pad_nd(y, (0, pad), 0)
     return y
 
 
@@ -3885,7 +4045,10 @@ def _reshape_view_helper_core_alg(
     for length in shape:
         # Handles tail unsqueezes
         if idx >= a_.ndim:
-            assert length == 1
+            if length != 1:
+                raise AssertionError(
+                    f"Cannot unsqueeze dimension with length {length}, expected 1"
+                )
             last_dim = a_.ndim - 1
             # NOTE: using split_dim instead of unsqueeze may seem silly here,
             # but it's necessary to get the strides correct
@@ -3957,7 +4120,10 @@ def _reshape_view_helper(a: TensorLikeType, *shape, allow_copy: bool) -> TensorL
     if a.ndim == 0:
         _a = a
         for length in shape:
-            assert length == 1
+            if length != 1:
+                raise AssertionError(
+                    f"Cannot reshape 0-dim tensor: shape dimension must be 1, got {length}"
+                )
             _a = unsqueeze(_a, -1)
         if _a is a:
             return prims.view_of(a)
@@ -3968,7 +4134,10 @@ def _reshape_view_helper(a: TensorLikeType, *shape, allow_copy: bool) -> TensorL
     if len(shape) == 0:
         _a = a
         for length in a.shape:
-            assert length == 1
+            if length != 1:
+                raise AssertionError(
+                    f"Cannot reshape to 0-dim tensor: shape dimension must be 1, got {length}"
+                )
             _a = squeeze(_a, -1)
         if _a is a:
             return prims.view_of(a)
@@ -4042,13 +4211,13 @@ def roll(a: TensorLikeType, shifts: DimsType, dims: DimsType = ()) -> TensorLike
         # Takes care of the case when dims is not specified (default)
         # By default, the tensor is flattened before shifting, after which the original shape is restored
         if len_dims == 0 and len_shifts == 1:
-            # pyrefly: ignore [bad-argument-type]
             return torch.roll(torch.flatten(a), shifts, 0).view(a.shape)
         if len_shifts != len_dims:
             raise RuntimeError(
                 f"shifts and dimensions must align. shifts: {len_shifts}, dims: {len_dims}"
             )
-        assert len_dims > 1
+        if len_dims <= 1:
+            raise AssertionError(f"Expected len_dims > 1, got {len_dims}")
         # pyrefly: ignore [bad-index]
         tail_shifts = shifts[1:]
         # pyrefly: ignore [bad-index, index-error]
@@ -4115,7 +4284,8 @@ def _check_stack_inputs(tensors: TensorSequenceType) -> None:
 @register_decomposition(aten.stack)
 @out_wrapper()
 def stack(tensors: TensorSequenceType, dim: int = 0) -> TensorLikeType:
-    assert len(tensors) > 0, "stack expects a non-empty TensorList"
+    if len(tensors) == 0:
+        raise AssertionError("stack expects a non-empty TensorList")
     wrapped_dim = utils.canonicalize_dim(tensors[0].ndim + 1, dim)
     # Refs need sparse support to check other condition
     if wrapped_dim < tensors[0].ndim:  # and not tensors[0].is_sparse:
@@ -4134,7 +4304,7 @@ def stack(tensors: TensorSequenceType, dim: int = 0) -> TensorLikeType:
 def softmax(
     a: TensorLikeType,
     dim: int,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
     result_dtype = dtype or a.dtype
     computation_dtype = utils.get_computation_dtype(result_dtype)
@@ -4217,14 +4387,14 @@ def index_copy_(x: TensorLike, dim: int, index: TensorLike, tensor: TensorLike):
 @register_decomposition(aten.index_fill)
 @out_wrapper()
 def index_fill(
-    x: TensorLike, dim: int, index: TensorLike, value: Union[NumberType, TensorLike]
+    x: TensorLike, dim: int, index: TensorLike, value: NumberType | TensorLike
 ):
     return _index_fill(x, dim, index, value, inplace=False)
 
 
 @register_decomposition(aten.index_fill_)
 def index_fill_(
-    x: TensorLike, dim: int, index: TensorLike, value: Union[NumberType, TensorLike]
+    x: TensorLike, dim: int, index: TensorLike, value: NumberType | TensorLike
 ):
     return _index_fill(x, dim, index, value, inplace=True)
 
@@ -4233,7 +4403,7 @@ def _index_fill(
     x: TensorLike,
     dim: int,
     index: TensorLike,
-    value: Union[NumberType, TensorLike],
+    value: NumberType | TensorLike,
     *,
     inplace: bool,
 ):
@@ -4270,11 +4440,12 @@ def _index_fill(
         if zero_dim:
             # The clone is necessary so that it returns a fresh tensor rather than a view
             out = out.squeeze(0).clone()
-        # index_fill preserves the strides. index_copy always returns contiguous tensors
-        if out.stride() != x.stride():
-            new_out = torch.empty_like(x)
-            new_out.copy_(out)
-            out = new_out
+        # index_fill preserves the strides for non-overlapping-and-dense inputs
+        # (matching clone(Preserve) behavior). index_copy always returns contiguous tensors.
+        if out.stride() != x.stride() and utils.is_non_overlapping_and_dense_or_false(
+            x
+        ):
+            out = prims.copy_strided(out, x.stride())
         return out
 
 
@@ -4312,11 +4483,11 @@ def index_select(x: TensorLike, dim: int, index: TensorLike):
         return torch.empty_like(x).index_copy(0, index, x.expand_as(index))
 
     idx = (slice(None),) * dim + (index,)
-    return x[idx].contiguous()
+    return x[idx].contiguous(memory_format=utils.suggest_memory_format(x))
 
 
 @register_decomposition(aten.squeeze.dims)
-def squeeze(a: TensorLikeType, dim: Optional[DimsType] = None) -> TensorLikeType:
+def squeeze(a: TensorLikeType, dim: DimsType | None = None) -> TensorLikeType:
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if dim is None:
@@ -4329,11 +4500,14 @@ def squeeze(a: TensorLikeType, dim: Optional[DimsType] = None) -> TensorLikeType
     dims = (dim,) if isinstance(dim, Dim) else dim
     # Short-circuits if the tensor has no dimensions
     if ndim == 0:
-        assert len(dims) == 0 or dims == (0,)
+        if not (len(dims) == 0 or dims == (0,)):
+            raise AssertionError(
+                f"Expected dims to be empty or (0,) for 0-dim tensor, got {dims}"
+            )
         return prims.view_of(a)
 
     # Note: squeeze does not modify tensors when the given dim is not a dimension of length 1
-    # would it be better if we just not allow 1 for unbacked at runtiume?
+    # would it be better if we just not allow 1 for unbacked at runtime?
     dims = tuple(d for d in dims if guard_or_false(a.shape[d] == 1))
     if len(dims) == 0:
         return prims.view_of(a)
@@ -4380,7 +4554,7 @@ def split_with_sizes(
 # CompositeImplicitAutograd - don't register decomp
 def tensor_split(
     a: TensorLikeType,
-    indices_or_sections: Union[Tensor, DimsType],
+    indices_or_sections: Tensor | DimsType,
     dim: int = 0,
 ) -> tuple[TensorLikeType, ...]:
     _dim = utils.canonicalize_dim(a.ndim, dim)
@@ -4477,7 +4651,7 @@ def hsplit(
                 + "!"
             ),
         )
-        # pyrefly: ignore [bad-argument-type]
+
         return tensor_split(a, split_size, dim)
 
     torch._check_type(
@@ -4519,7 +4693,7 @@ def vsplit(
                 f"!"
             ),
         )
-        # pyrefly: ignore [bad-argument-type]
+
         return tensor_split(a, split_size, 0)
 
     torch._check_type(
@@ -4560,10 +4734,28 @@ def diagonal_scatter(
     dim1: int = 0,
     dim2: int = 1,
 ) -> TensorLikeType:
-    out = utils.clone_preserve_strides(input)
+    from torch.fx.experimental.symbolic_shapes import guard_or_false, sym_or
+
+    # Mirror at::native::clone_preserve_strides: when the input has internal
+    # memory overlap (e.g. an expand from a scalar with stride 0), we cannot
+    # preserve its strides because copy_to() below would write through aliased
+    # storage and corrupt non-diagonal positions. This arises in the backward
+    # of diagonal_scatter(x, src).sum(), where grad_output is expanded. Fall
+    # back to a plain clone, which materializes a contiguous buffer.
+    if builtins.any(
+        guard_or_false(sz > 1) and guard_or_false(s == 0)
+        for sz, s in zip(input.size(), input.stride())
+    ):
+        out = input.clone()
+    else:
+        out = utils.clone_preserve_strides(input)
     diag = out.diagonal(offset, dim1, dim2)
+    # Use sym_or + guard_or_false to handle unbacked symbolic dimensions.
     torch._check(
-        diag.shape == src.shape,
+        diag.ndim == src.ndim
+        and not guard_or_false(
+            sym_or(*(d1 != d2 for d1, d2 in zip(diag.shape, src.shape)))
+        ),
         lambda: "expected src to have a size equal to the diagonal of the input."
         f"Got {src.shape} for a diagonal of shape {diag.shape}",
     )
@@ -4591,19 +4783,16 @@ def diagonal(
 
     storage_offset = self.storage_offset()
 
+    # Use sym_min/sym_max to handle unbacked symbolic dimensions.
     if offset >= 0:
-        diag_size = max(min(self.size()[dim1], self.size()[dim2] - offset), 0)
+        diag_size = sym_max(sym_min(self.size()[dim1], self.size()[dim2] - offset), 0)
+        storage_offset += offset * self.stride()[dim2]
     else:
-        diag_size = max(min(self.size()[dim1] + offset, self.size()[dim2]), 0)
-
-    if diag_size > 0:
-        if offset >= 0:
-            storage_offset += offset * self.stride()[dim2]
-        else:
-            storage_offset -= offset * self.stride()[dim1]
+        diag_size = sym_max(sym_min(self.size()[dim1] + offset, self.size()[dim2]), 0)
+        storage_offset -= offset * self.stride()[dim1]
 
     sizes = [s for i, s in enumerate(self.size()) if i not in (dim1, dim2)]
-    sizes.append(diag_size)
+    sizes.append(diag_size)  # type: ignore[arg-type]
 
     strides = [s for i, s in enumerate(self.stride()) if i not in (dim1, dim2)]
     strides.append(self.stride()[dim1] + self.stride()[dim2])
@@ -4810,8 +4999,8 @@ def _cumsumprod_common(
     a: TensorLikeType,
     dim: int,
     *,
-    dtype: Optional[torch.dtype] = None,
-    out: Optional[Tensor] = None,
+    dtype: torch.dtype | None = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     # We implement all the kwargs of a reduction. ATen just handles dtype
     # nb. This decomposition may not be as efficient as a backend-specific implementation
@@ -4833,8 +5022,8 @@ def cumsum(
     a: TensorLikeType,
     dim: int,
     *,
-    dtype: Optional[torch.dtype] = None,
-    out: Optional[Tensor] = None,
+    dtype: torch.dtype | None = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     return _cumsumprod_common(func=sum, init=0, a=a, dim=dim, dtype=dtype, out=out)
 
@@ -4844,8 +5033,8 @@ def cumprod(
     a: TensorLikeType,
     dim: int,
     *,
-    dtype: Optional[torch.dtype] = None,
-    out: Optional[Tensor] = None,
+    dtype: torch.dtype | None = None,
+    out: Tensor | None = None,
 ) -> TensorLikeType:
     return _cumsumprod_common(func=prod, init=1, a=a, dim=dim, dtype=dtype, out=out)
 
@@ -4865,7 +5054,23 @@ def unsqueeze(a: TensorLikeType, dim: int) -> TensorLikeType:
 # doesn't support unpacked shapes
 # TODO: Turn this into a decomposition (currently fails on reshape meta tests)
 @register_decomposition(aten.view.default)
-def view(a: TensorLikeType, *shape: ShapeType) -> TensorLikeType:
+def view(a: TensorLikeType, *shape: ShapeType | tuple[ShapeType]) -> TensorLikeType:
+    from torch._subclasses.fake_impls import (
+        _view_has_unbacked_input,
+        _view_unbacked_meta,
+    )
+
+    # Cast to satisfy the type checker since the varargs annotation creates
+    # tuple[ShapeType | tuple[ShapeType], ...] but the function expects
+    # Union[ShapeType, tuple[ShapeType]].
+    shape_tuple = utils.extract_shape_from_varargs(
+        cast(ShapeType | tuple[ShapeType], shape), validate=False
+    )
+    if torch.fx.experimental._config.backed_size_oblivious or _view_has_unbacked_input(
+        a,
+        shape_tuple,
+    ):
+        return _view_unbacked_meta(a, shape_tuple)
     return _reshape_view_helper(a, *shape, allow_copy=False)
 
 
@@ -4883,7 +5088,7 @@ def ravel(a: TensorLikeType) -> TensorLikeType:
 # missing ref impl. for aten.gather
 @out_wrapper()
 def take_along_dim(
-    a: torch.Tensor, indices: torch.Tensor, dim: Optional[int] = None
+    a: torch.Tensor, indices: torch.Tensor, dim: int | None = None
 ) -> torch.Tensor:
     torch._check(
         a.ndim == indices.ndim,
@@ -4925,9 +5130,9 @@ def take_along_dim(
 @out_wrapper()
 def empty(
     *shape,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     requires_grad: bool = False,
     pin_memory: bool = False,
     memory_format: torch.memory_format = torch.contiguous_format,
@@ -4942,12 +5147,14 @@ def empty(
     if memory_format == torch.contiguous_format:
         strides = utils.make_contiguous_strides_for(shape)
     elif memory_format == torch.channels_last_3d:
+        # pyrefly: ignore [bad-specialization]
         strides = utils.make_channels_last_3d_strides_for(shape)
     else:  # memory_format == torch.channels_last
         torch._check(
             memory_format == torch.channels_last,
             lambda: f"torch.empty: received an unknown memory format {memory_format}!",
         )
+        # pyrefly: ignore [bad-specialization]
         strides = utils.make_channels_last_2d_strides_for(shape)
 
     return torch.empty_strided(
@@ -4965,9 +5172,9 @@ def empty(
 def empty_permuted(
     shape,
     physical_layout,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     requires_grad: bool = False,
     pin_memory: bool = False,
 ) -> TensorLikeType:
@@ -4986,9 +5193,9 @@ def new_empty(
     a: TensorLikeType,
     size: ShapeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
 ) -> TensorLikeType:
     dtype = a.dtype if dtype is None else dtype
@@ -5011,9 +5218,9 @@ def new_empty_strided(
     size: ShapeType,
     stride: StrideType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
 ) -> TensorLikeType:
     """
@@ -5038,9 +5245,9 @@ def new_empty_strided(
 @out_wrapper()
 def zeros(
     *size,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5066,9 +5273,9 @@ def new_zeros(
     a: TensorLikeType,
     size: ShapeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5091,9 +5298,9 @@ def new_zeros(
 @out_wrapper()
 def ones(
     *size,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5119,9 +5326,9 @@ def new_ones(
     a: TensorLikeType,
     size: ShapeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5147,9 +5354,9 @@ def new_full(
     size: ShapeType,
     fill_value: NumberType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
 ) -> TensorLikeType:
     dtype = a.dtype if dtype is None else dtype
@@ -5168,10 +5375,11 @@ def new_full(
 
 @aten.empty.out.py_impl(DispatchKey.CompositeImplicitAutograd)
 def empty_out(
-    size: TensorLikeType,
+    size: ShapeType,
     out: TensorLikeType,
-    memory_format: Optional[torch.memory_format] = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TensorLikeType:
+    _maybe_resize_out(out, size, memory_format)
     return out
 
 
@@ -5180,9 +5388,9 @@ def empty_out(
 def empty_like(
     a: TensorLikeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    device: Optional[DeviceLikeType] = None,
-    layout: Optional[torch.layout] = None,
+    dtype: torch.dtype | None = None,
+    device: DeviceLikeType | None = None,
+    layout: torch.layout | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
     memory_format: torch.memory_format = torch.preserve_format,
@@ -5222,12 +5430,12 @@ def empty_like(
 @out_wrapper()
 def arange(
     start: NumberType = 0,
-    end: Optional[NumberType] = None,
+    end: NumberType | None = None,
     step: NumberType = 1,
     *,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5235,9 +5443,12 @@ def arange(
     utils.check_pin_memory(pin_memory)
     device = torch.device(utils.device_or_default(device))
 
-    assert not isinstance(start, complex)
-    assert not isinstance(end, complex)
-    assert not isinstance(step, complex)
+    if isinstance(start, complex):
+        raise AssertionError("arange does not support complex start")
+    if isinstance(end, complex):
+        raise AssertionError("arange does not support complex end")
+    if isinstance(step, complex):
+        raise AssertionError("arange does not support complex step")
 
     # Case: torch.arange(5)
     if end is None:
@@ -5279,16 +5490,15 @@ def arange(
         xend = sym_int(end)
         xstep = sym_int(step)
 
-    # For int64 we truncate arguments to int before calculating length, but
-    # other integral dtypes we don't. Weird... but needed to match ATen shapes.
-    if dtype == torch.int64 or integer_args:
+    if integer_args:
+        torch._check_value(xstep != 0, lambda: "step must be nonzero")  # type: ignore[possibly-undefined]
         # Uses floordiv to avoid ceil in inductor.
         sgn = bool(xstep > 0) - bool(xstep < 0)  # type: ignore[possibly-undefined]
         length = (xend - xstart + xstep - sgn) // xstep  # type: ignore[possibly-undefined]
     else:
         length = math.ceil((end - start) / step)
 
-    if is_integer:
+    if is_integer and integer_args:
         return prims.iota(
             length,
             start=xstart,  # type: ignore[possibly-undefined]
@@ -5297,6 +5507,17 @@ def arange(
             device=device,
             requires_grad=requires_grad,
         )
+
+    if is_integer and not integer_args:
+        index = prims.iota(
+            length,
+            start=0,
+            step=1,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+        )
+        return xstart + xstep * index  # type: ignore[possibly-undefined]
 
     index = prims.iota(
         length,
@@ -5325,13 +5546,14 @@ def arange(
     type_promoting_args=("start", "end", "weight"),
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
-def lerp(start: Tensor, end: Tensor, weight: Union[Tensor, NumberType]):
+def lerp(start: Tensor, end: Tensor, weight: Tensor | NumberType):
     inputs = [start, end]
     if isinstance(weight, Number):
         weight = start.new_full((), weight)  # type: ignore[arg-type]
     else:
         inputs.append(weight)
-    assert isinstance(weight, Tensor)  # mypy
+    if not isinstance(weight, Tensor):
+        raise AssertionError(f"weight must be Tensor at this point, got {type(weight)}")
     # We implement it this way for numerical stability. We assume (in the stability optimisation)
     # that 0 <= weight <= 1. We take the abs to deal with complex numbers
     # We want to perform operations near zero, which is where floating points are most precise
@@ -5353,12 +5575,12 @@ def lerp(start: Tensor, end: Tensor, weight: Union[Tensor, NumberType]):
 @register_decomposition(aten.linspace)
 @out_wrapper()
 def linspace(
-    start: Union[NumberType, TensorLikeType],
-    end: Union[NumberType, TensorLikeType],
+    start: NumberType | TensorLikeType,
+    end: NumberType | TensorLikeType,
     steps: NumberType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    device: DeviceLikeType | None = None,
     layout: torch.layout = torch.strided,
     pin_memory: bool = False,
     requires_grad: bool = False,
@@ -5368,13 +5590,13 @@ def linspace(
             start.dim() == 0,
             lambda: "linspace only supports 0-dimensional start and end tensors",
         )
-        start = _maybe_convert_to_dtype(start, torch.float64)
+        start = _maybe_convert_to_dtype(start, highest_precision_float(device))
     if isinstance(end, TensorLikeType):
         torch._check(
             end.dim() == 0,
             lambda: "linspace only supports 0-dimensional start and end tensors",
         )
-        end = _maybe_convert_to_dtype(end, torch.float64)
+        end = _maybe_convert_to_dtype(end, highest_precision_float(device))
 
     if builtins.any(isinstance(arg, complex) for arg in (start, end, steps)):
         default_complex_dtype = utils.corresponding_complex_dtype(
@@ -5389,7 +5611,8 @@ def linspace(
             )
     else:
         dtype = dtype or torch.get_default_dtype()
-    assert isinstance(dtype, torch.dtype)
+    if not isinstance(dtype, torch.dtype):
+        raise AssertionError(f"dtype must be torch.dtype, got {type(dtype)}")
 
     # steps does not participate in the computation of the dtype
     torch._check_type(
@@ -5397,7 +5620,8 @@ def linspace(
         lambda: f"received an invalid combination of arguments - got \
 ({type(start).__name__}, {type(end).__name__}, {type(steps).__name__})",
     )
-    assert isinstance(steps, IntLike)  # for mypy
+    if not isinstance(steps, IntLike):
+        raise AssertionError(f"steps must be IntLike, got {type(steps)}")  # for mypy
     torch._check(steps >= 0, lambda: "number of steps must be non-negative")
 
     factory_kwargs = {
@@ -5444,13 +5668,13 @@ def linspace(
 @register_decomposition(aten.logspace)
 @out_wrapper()
 def logspace(
-    start: Union[NumberType, TensorLikeType],
-    end: Union[NumberType, TensorLikeType],
+    start: NumberType | TensorLikeType,
+    end: NumberType | TensorLikeType,
     steps: NumberType,
     base: NumberType = 10,
     *,
-    dtype: Optional[torch.dtype] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    device: DeviceLikeType | None = None,
     layout: torch.layout = torch.strided,
     pin_memory: bool = False,
     requires_grad: bool = False,
@@ -5486,7 +5710,8 @@ def logspace(
     else:
         _dtype = torch.float64
 
-    assert not isinstance(base, complex)  # for mypy
+    if isinstance(base, complex):
+        raise AssertionError(f"base must not be complex, got {type(base)}")  # for mypy
     if base < 0:
         raise NotImplementedError
     ret = torch.linspace(  # type: ignore[misc]
@@ -5515,14 +5740,17 @@ def meshgrid(*tensors: TensorLikeType, indexing: str):
 
 @register_decomposition(aten.meshgrid)  # type: ignore[misc]
 def meshgrid(
-    *tensors: Union[TensorLikeType, list[TensorLikeType], tuple[TensorLikeType]],
+    *tensors: TensorLikeType | list[TensorLikeType] | tuple[TensorLikeType],
     indexing: str,
 ) -> list[TensorLikeType]:
     # This ref simultaneously handles two overloads (see stubs above)
     # The `indexing` argument is currently optional for torch.meshgrid, but we
     # plan to make the argument required: https://github.com/pytorch/pytorch/issues/50276
     if isinstance(tensors[0], (list, tuple)):
-        assert len(tensors) == 1
+        if len(tensors) != 1:
+            raise AssertionError(
+                f"Expected exactly 1 tensor list/tuple, got {len(tensors)}"
+            )
         tensors = tuple(tensors[0])
 
     torch._check(
@@ -5558,7 +5786,8 @@ def meshgrid(
 
     result_shape: list[int] = []
     for t in tensors:
-        assert isinstance(t, TensorLike)  # mypy
+        if not isinstance(t, TensorLike):
+            raise AssertionError(f"expected TensorLike, got {type(t)}")  # mypy
         torch._check(
             t.ndim == 0 or t.ndim == 1,
             lambda: f"torch.meshgrid: Expected 0D or 1D tensor in the tensor list but got: {t}",
@@ -5567,7 +5796,8 @@ def meshgrid(
 
     grids: list[TensorLikeType] = []
     for i, t in enumerate(tensors):
-        assert isinstance(t, TensorLike)  # mypy
+        if not isinstance(t, TensorLike):
+            raise AssertionError(f"expected TensorLike, got {type(t)}")  # mypy
         if t.ndim == 0:
             t = t.view((1,))
         grids.append(prims.broadcast_in_dim(t, result_shape, (i,)))
@@ -5582,8 +5812,8 @@ def meshgrid(
 # CompositeImplicitAutograd - don't register decomp
 def movedim(
     input: TensorLikeType,
-    source: Union[int, DimsSequenceType],
-    destination: Union[int, DimsSequenceType],
+    source: int | DimsSequenceType,
+    destination: int | DimsSequenceType,
 ) -> TensorLikeType:
     """
     Reference implementation of torch.movedim
@@ -5646,11 +5876,11 @@ def movedim(
 @register_decomposition(aten.empty_strided)
 @out_wrapper()
 def empty_strided(
-    shape: Union[ShapeType, tuple[ShapeType]],
+    shape: ShapeType | tuple[ShapeType],
     strides: StrideType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    device: DeviceLikeType | None = None,
     layout: torch.layout = torch.strided,
     requires_grad: bool = False,
     pin_memory: bool = False,
@@ -5683,11 +5913,11 @@ def _strength_reduce_integer(val: int) -> torch.dtype:
 @out_wrapper()
 def eye(
     n: int,
-    m: Optional[int] = None,
+    m: int | None = None,
     *,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,  # TODO: unused
 ) -> TensorLikeType:
@@ -5730,9 +5960,9 @@ def full(
     shape: ShapeType,
     fill_value: NumberType,
     *,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
@@ -5757,9 +5987,9 @@ def full_like(
     a: TensorLikeType,
     fill_value: NumberType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
     memory_format: torch.memory_format = torch.preserve_format,
@@ -5781,9 +6011,9 @@ def full_like(
 def zeros_like(
     a: TensorLikeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
     memory_format: torch.memory_format = torch.preserve_format,
@@ -5805,9 +6035,9 @@ def zeros_like(
 def ones_like(
     a: TensorLikeType,
     *,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[DeviceLikeType] = None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
     requires_grad: bool = False,
     memory_format: torch.memory_format = torch.preserve_format,
@@ -5828,9 +6058,9 @@ def ones_like(
 @out_wrapper()
 def randn(
     *shape,
-    dtype: Optional[torch.dtype] = None,
-    device: Optional[DeviceLikeType] = None,
-    layout: Optional[torch.layout] = None,
+    dtype: torch.dtype | None = None,
+    device: DeviceLikeType | None = None,
+    layout: torch.layout | None = None,
     requires_grad: bool = False,
     pin_memory: bool = False,
 ) -> TensorLikeType:
@@ -5854,9 +6084,9 @@ def randn(
 def scalar_tensor(
     a: NumberType,
     *,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     layout: torch.layout = torch.strided,
-    device: Optional[DeviceLikeType] = None,
+    device: DeviceLikeType | None = None,
     pin_memory: bool = False,
 ) -> TensorLikeType:
     utils.check_layout(layout)
@@ -5873,23 +6103,31 @@ def scalar_tensor(
 
 def _uniform_helper(
     shape: ShapeType,
-    low: Union[bool, int, float] = 0.0,
-    high: Union[bool, int, float] = 1.0,
+    low: bool | int | float = 0.0,
+    high: bool | int | float = 1.0,
     *,
+    stride: ShapeType,
     dtype: torch.dtype,
     device: DeviceLikeType,
 ) -> TensorLikeType:
     utils.validate_shape(shape)
 
-    assert isinstance(low, Number)
-    assert isinstance(high, Number)
+    if not isinstance(low, Number):
+        raise AssertionError(f"low must be Number, got {type(low)}")
+    if not isinstance(high, Number):
+        raise AssertionError(f"high must be Number, got {type(high)}")
+    # pyrefly: ignore [bad-assignment]
     low = sym_float(low)
+    # pyrefly: ignore [bad-assignment]
     high = sym_float(high)
 
-    assert isinstance(dtype, torch.dtype)
+    if not isinstance(dtype, torch.dtype):
+        raise AssertionError(f"dtype must be torch.dtype, got {type(dtype)}")
     device = utils.canonicalize_device(device)
 
-    return prims._uniform_helper(shape, low=low, high=high, dtype=dtype, device=device)
+    return prims._uniform_helper(
+        shape, low=low, high=high, dtype=dtype, device=device, stride=stride
+    )
 
 
 @register_decomposition(aten.masked_fill)
@@ -5930,7 +6168,7 @@ def masked_fill(a: TensorLikeType, mask: TensorLikeType, value: TensorOrNumberLi
 
     # Since `where` allows type-promotion,
     # cast value to correct type before passing to `where`
-    # pyrefly: ignore [no-matching-overload]
+
     value = _maybe_convert_to_dtype(value, a.dtype)
     r = torch.where(mask, value, a)  # type: ignore[arg-type]
 
@@ -5989,11 +6227,11 @@ def equal(a: TensorLikeType, b: TensorLikeType) -> bool:
 @out_wrapper(exact_dtype=True)
 def norm(
     input: TensorLikeType,
-    p: Optional[Union[float, str]] = "fro",
-    dim: Optional[DimsType] = None,
+    p: float | str | None = "fro",
+    dim: DimsType | None = None,
     keepdim: bool = False,
     *,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
     # In these cases we compute the "Frobenius norm"
     if (
@@ -6024,8 +6262,8 @@ def trace(self: TensorLikeType) -> TensorLikeType:
 
 def _make_r_binary_op(base_op):
     def rop(
-        a: Union[TensorLikeType, NumberType],
-        b: Union[TensorLikeType, NumberType],
+        a: TensorLikeType | NumberType,
+        b: TensorLikeType | NumberType,
     ) -> TensorLikeType:
         return base_op(b, a)
 
@@ -6281,7 +6519,8 @@ def bucketize(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def cauchy(self, median=0, sigma=1, generator=None):
-    assert generator is None
+    if generator is not None:
+        raise AssertionError("generator is not supported in refs")
     torch._check(
         not utils.is_complex_dtype(self.dtype)
         and not utils.is_integer_dtype(self.dtype)
@@ -6303,7 +6542,8 @@ def cauchy(self, median=0, sigma=1, generator=None):
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def exponential(self, rate=1, generator=None):
-    assert generator is None
+    if generator is not None:
+        raise AssertionError("generator is not supported in refs")
     torch._check(
         not utils.is_complex_dtype(self.dtype)
         and not utils.is_integer_dtype(self.dtype)
@@ -6336,7 +6576,8 @@ def exponential(self, rate=1, generator=None):
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def geometric(self, p, generator=None):
-    assert generator is None
+    if generator is not None:
+        raise AssertionError("generator is not supported in refs")
     # TODO: fix inductor rand_like for integer, bool dtypes
     torch._check(
         not utils.is_complex_dtype(self.dtype)
@@ -6357,7 +6598,8 @@ def geometric(self, p, generator=None):
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def log_normal(self, mean=1, std=2, generator=None):
-    assert generator is None
+    if generator is not None:
+        raise AssertionError("generator is not supported in refs")
     torch._check(
         not utils.is_complex_dtype(self.dtype)
         and not utils.is_integer_dtype(self.dtype)
@@ -6371,7 +6613,6 @@ def log_normal(self, mean=1, std=2, generator=None):
     return torch.exp(std * torch.randn_like(self) + mean)
 
 
-# TODO: add support for functionalization aten.normal_functional
 # NOTE: the device and dtype will be ignored when shape is None
 @register_decomposition(aten.normal)
 @out_wrapper()
@@ -6393,7 +6634,8 @@ def normal(
     device=None,
     pin_memory=None,
 ):
-    assert layout is None or layout == torch.strided
+    if layout is not None and layout != torch.strided:
+        raise AssertionError(f"layout must be None or torch.strided, got {layout}")
 
     if not isinstance(std, TensorLike):
         torch._check(
@@ -6439,6 +6681,22 @@ def normal_(self, mean=0, std=1, *, generator=None):
     return normal(mean, std, self.shape, out=self, generator=generator)
 
 
+@register_decomposition(aten.normal_functional)
+def normal_functional(self, mean=0, std=1, *, generator=None):
+    res = normal(
+        mean,
+        std,
+        self.shape,
+        dtype=self.dtype,
+        device=self.device,
+        generator=generator,
+    )
+    if self.stride() == res.stride():
+        return res
+    new_stride = utils.compute_elementwise_output_strides(self)
+    return res.as_strided(self.shape, new_stride)
+
+
 @_make_elementwise_unary_reference(ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT)
 def rad2deg(self: TensorLikeType):
     torch._check(
@@ -6461,7 +6719,7 @@ def deg2rad(self: TensorLikeType):
 
 @register_decomposition(aten.count_nonzero)
 @out_wrapper()
-def count_nonzero(self, dim: Optional[DimsType] = None):
+def count_nonzero(self, dim: DimsType | None = None):
     return (self != 0).sum(dim)
 
 
@@ -6749,7 +7007,7 @@ def _infer_scalar_type(obj):
 # Analogous to recursive_store
 # xref: recursive_store in torch/csrc/utils/tensor_new.cpp
 def _recursive_build(
-    scalarType: torch.dtype, obj: Union[TensorOrNumberLikeType, TensorSequenceType]
+    scalarType: torch.dtype, obj: TensorOrNumberLikeType | TensorSequenceType
 ):
     if isinstance(obj, Tensor) and obj.numel() == 1:
         return obj.detach().to(dtype=scalarType, device="cpu", copy=True).view(())
@@ -6826,6 +7084,16 @@ def _internal_new_from_data(
         tensor = _recursive_build(inferred_scalar_type, data)
 
         tensor = tensor.to(device, inferred_scalar_type, non_blocking=False, copy=False)
+        if pin_memory and torch.device(device).type == "cpu":
+            pinned_tensor = torch.empty_strided(
+                tensor.shape,
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device=tensor.device,
+                pin_memory=True,
+            )
+            pinned_tensor.copy_(tensor)
+            tensor = pinned_tensor
 
     # NB: lift_fresh is not needed, because we built the tensor from scalars
     # guaranteeing a fresh tensor in this case

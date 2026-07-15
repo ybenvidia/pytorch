@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -36,6 +37,14 @@ NUM_PROCS = 1 if IS_MEM_LEAK_CHECK else 3 if not TEST_CUDA or SM80OrLater else 2
 NUM_PROCS_FOR_SHARDING_CALC = NUM_PROCS if not IS_ROCM or IS_MEM_LEAK_CHECK else 2
 THRESHOLD = 60 * 10  # 10 minutes
 
+MIN_TEST_FILE_TIMES = {
+    # Generated stats can record a fully skipped CPU Inductor OpInfo run.
+    # Keep enough pytest shards to stay under per-test timeouts when that
+    # near-zero runtime is stale. Windows CI intentionally skips this file, so
+    # do not inflate Windows shard estimates with no-op pytest shards.
+    "inductor/test_torchinductor_opinfo": THRESHOLD * 56,
+}
+
 # See Note [ROCm parallel CI testing]
 # Special logic for ROCm GHA runners to query number of GPUs available.
 # torch.version.hip was not available to check if this was a ROCm self-hosted runner.
@@ -50,7 +59,8 @@ if IS_ROCM and not IS_MEM_LEAK_CHECK:
         for line in lines:
             if " gfx" in line:
                 count += 1
-        assert count > 0  # there must be at least 1 GPU
+        if count == 0:
+            raise AssertionError("There must be at least 1 GPU")
         # Limiting to 8 GPUs(PROCS)
         NUM_PROCS = min(count, 8)
     except subprocess.CalledProcessError:
@@ -106,6 +116,11 @@ def get_duration(
     test_class_times.  Returns None if the time is unknown."""
     file_duration = test_file_times.get(test.test_file, None)
     if test.is_full_file():
+        min_duration = None
+        if not BUILD_ENVIRONMENT.startswith(("win-", "windows-")):
+            min_duration = MIN_TEST_FILE_TIMES.get(test.test_file)
+        if min_duration is not None:
+            return max(file_duration or 0, min_duration)
         return file_duration
 
     def get_duration_for_classes(
@@ -131,9 +146,10 @@ def get_duration(
 
     if included:
         return included_classes_duration
-    assert excluded, (
-        f"TestRun {test} is not full file but doesn't have included or excluded classes"
-    )
+    if not excluded:
+        raise AssertionError(
+            f"TestRun {test} is not full file but doesn't have included or excluded classes"
+        )
     if file_duration is None:
         return None
     return file_duration - excluded_classes_duration
@@ -147,9 +163,8 @@ def shard(
 ) -> None:
     # Modifies sharded_jobs in place
     if len(sharded_jobs) == 0:
-        assert len(pytest_sharded_tests) == 0, (
-            "No shards provided but there are tests to shard"
-        )
+        if len(pytest_sharded_tests) != 0:
+            raise AssertionError("No shards provided but there are tests to shard")
         return
 
     round_robin_index = 0
@@ -167,7 +182,8 @@ def shard(
     def _shard_serial(
         tests: Sequence[ShardedTest], sharded_jobs: list[ShardJob]
     ) -> None:
-        assert estimated_time_limit is not None, "Estimated time limit must be provided"
+        if estimated_time_limit is None:
+            raise AssertionError("Estimated time limit must be provided")
         new_sharded_jobs = sharded_jobs
         for test in tests:
             if (
@@ -270,3 +286,12 @@ def calculate_shards(
 
 def get_test_case_configs(dirpath: str) -> None:
     get_disabled_tests(dirpath=dirpath)
+
+
+# Strip the "test"/"test-osdc" target suffix to recover the build env, the key
+# tools/torchci writes to test-times.json. Must match the write-side extraction.
+JOB_BASE_NAME_RE = re.compile(r" / test(?:-osdc)? \(")
+
+
+def get_job_base_name(job_name: str) -> str:
+    return JOB_BASE_NAME_RE.split(job_name, maxsplit=1)[0]
